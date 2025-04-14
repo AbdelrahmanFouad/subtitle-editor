@@ -49,22 +49,33 @@ def parse_srt(srt_content: str):
     raw_blocks = re.split(r'\n\s*\n', srt_content.strip())
     subtitles = []
     for block in raw_blocks:
-        lines = block.splitlines()
+        lines = block.strip().splitlines()
         if len(lines) >= 3:
             index = lines[0].strip()
             times = lines[1].strip()
             if "-->" in times:
                 start, end = [t.strip() for t in times.split("-->")]
-                text = "\n".join(lines[2:])
+                text_lines = lines[2:]
+                
+                # Smart separation: assume top is Arabic, bottom is English
+                if len(text_lines) >= 2:
+                    mid = len(text_lines) // 2
+                    arabic = "\n".join(text_lines[:mid]).strip()
+                    english = "\n".join(text_lines[mid:]).strip()
+                else:
+                    arabic = ""
+                    english = "\n".join(text_lines).strip()
+
                 subtitles.append({
                     "index": index,
                     "start": start,
                     "end": end,
-                    "text": text,
-                    "arabic": "",
-                    "english": text  # Default to original as English
+                    "text": "",  # not used anymore
+                    "arabic": arabic,
+                    "english": english
                 })
     return subtitles
+
 
 def build_srt(subtitles):
     output = []
