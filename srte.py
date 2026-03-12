@@ -116,9 +116,11 @@ if st.button("🚀 Translate Entire File (Batches)"):
                 
             except Exception as e:
                 if any(x in str(e).lower() for x in ["quota", "429", "resource"]):
-                    st.warning(f"Quota hit on key #{key_idx+1}. Rotating in 65s...")
-                    time.sleep(65)
+                    st.warning(f"Quota hit on key #{key_idx+1}. Rotating to next key...")
+                    time.sleep(2) # Short pause for UI visibility
                     key_idx = (key_idx + 1) % len(api_keys)
+                    # If we've looped back to the first key, then we might want a longer wait, 
+                    # but per user request, we are removing the 65s between rotations.
                 else:
                     st.error(f"Error: {e}")
                     break
