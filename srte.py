@@ -42,6 +42,13 @@ textarea::-webkit-scrollbar-thumb {
     border-radius: 10px;
     border: 3px solid #f1f1f1;
 }
+.live-preview {
+    background-color: #e3f2fd;
+    padding: 10px;
+    border-radius: 5px;
+    border-left: 5px solid #2196f3;
+    margin-bottom: 10px;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -133,6 +140,7 @@ if st.button("Translate Entire File (in batches)"):
     batch_size = 12
     progress_bar = st.progress(0)
     status_text = st.empty()
+    preview_area = st.empty()
 
     key_idx = 0
     current_idx = 0
@@ -155,6 +163,14 @@ if st.button("Translate Entire File (in batches)"):
                     st.session_state.subs[idx]["arabic"] = translations[i]
                     applied += 1
             
+            if translations:
+                preview_area.markdown(f"""
+                <div class='live-preview'>
+                    <b>Latest Translation (Block {st.session_state.subs[batch_indices[applied-1]]['index']}):</b><br>
+                    {translations[-1].replace('\n', '<br>')}
+                </div>
+                """, unsafe_allow_html=True)
+
             current_idx += applied
             progress_bar.progress(current_idx / total_pending)
             time.sleep(10)
@@ -171,7 +187,9 @@ if st.button("Translate Entire File (in batches)"):
 
     if current_idx >= total_pending:
         progress_bar.progress(1.0)
-        status_text.success("Translation complete!")
+        status_text.success("Translation complete! Refreshing UI...")
+        time.sleep(1)
+        st.rerun() # FORCE UI REFRESH TO SHOW TRANSLATIONS
 
 # --- Display Subtitle Blocks for Review ---
 st.write("### Subtitle Blocks")
@@ -184,25 +202,21 @@ for i, s in enumerate(st.session_state.subs):
         start_time = st.text_input("Start", s["start"], key=f"start_{i}")
         end_time = st.text_input("End", s["end"], key=f"end_{i}")
     with c2:
-        arabic_text = st.text_area("Arabic", s["arabic"], key=f"arabic_{i}", height=80)
-        english_text = st.text_area("English", "\n".join(s["english_lines"]), key=f"english_{i}", height=80)
-    edited.append({
-        "index": s["index"],
-        "start": start_time,
-        "end": end_time,
-        "arabic": arabic_text,
-        "english_lines": english_text.splitlines()
-    })
+        # Use value=s["arabic"] to ensure it takes the session state update
+        arabic_text = st.text_area("Arabic", value=s["arabic"], key=f"arabic_{i}", height=80)
+        english_text = st.text_area("English", value="\n".join(s["english_lines"]), key=f"english_{i}", height=80)
+    
+    # Track edits back to session state
+    st.session_state.subs[i]["start"] = start_time
+    st.session_state.subs[i]["end"] = end_time
+    st.session_state.subs[i]["arabic"] = arabic_text
+    st.session_state.subs[i]["english_lines"] = english_text.splitlines()
+    
     st.markdown("</div>", unsafe_allow_html=True)
-st.session_state.subs = edited
 
 # --- Build & Download Section ---
 if st.button("Build & Download SRT"):
     final = build_srt(st.session_state.subs)
-    st.session_state["final_srt"] = final
-
-if "final_srt" in st.session_state:
     st.write("### Final Updated SRT Content")
-    final_content = st.text_area("SRT Content", st.session_state["final_srt"], height=300)
-    st.session_state["final_srt"] = final_content
+    final_content = st.text_area("SRT Content", final, height=300)
     st.download_button("Download .srt", final_content, "translated.srt", "text/plain")
