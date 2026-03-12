@@ -142,7 +142,7 @@ if st.button("Translate Entire File (in batches)"):
                 st.session_state.subs[idx]["arabic"] = translations[j]
         progress = min(1.0, (batch_start + batch_size) / total_pending)
         progress_bar.progress(progress)
-        time.sleep(3)  # Wait 3 seconds between batches
+        time.sleep(6)  # Wait 3 seconds between batches
     progress_bar.progress(1.0)
     status_text.success("Translation complete!")
 
