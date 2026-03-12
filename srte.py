@@ -3,11 +3,11 @@ import re
 import time
 import chardet
 import streamlit as st
-from google import genai
-from google.genai import types
+import google.generativeai as genai
 
 # --- Configure Gemini API ---
-DEFAULT_MODEL = "gemini-2.5-flash" 
+genai.configure(api_key=st.secrets["gemini_api_key"])
+model = genai.GenerativeModel(model_name="gemini-2.5-flash-lite")
 
 st.set_page_config(layout="wide")
 st.title("SRT Editor & Translator: English → Arabic (AI)")
@@ -15,9 +15,33 @@ st.title("SRT Editor & Translator: English → Arabic (AI)")
 # --- CSS for general styling ---
 st.markdown("""
 <style>
-.subtitle-block { padding: 4px; margin-bottom: 4px; border: 1px solid #ddd; border-radius: 4px; background: #f9f9f9; }
-.block-heading { font-size: 1rem; font-weight: 600; margin-bottom: 3px; }
-textarea { scrollbar-width: auto; scrollbar-color: #888 #f1f1f1; }
+.subtitle-block { 
+    padding: 4px; 
+    margin-bottom: 4px; 
+    border: 1px solid #ddd; 
+    border-radius: 4px; 
+    background: #f9f9f9; 
+}
+.block-heading { 
+    font-size: 1rem; 
+    font-weight: 600; 
+    margin-bottom: 3px; 
+}
+textarea {
+    scrollbar-width: auto;
+    scrollbar-color: #888 #f1f1f1;
+}
+textarea::-webkit-scrollbar {
+    width: 16px;
+}
+textarea::-webkit-scrollbar-track {
+    background: #f1f1f1;
+}
+textarea::-webkit-scrollbar-thumb {
+    background-color: #888;
+    border-radius: 10px;
+    border: 3px solid #f1f1f1;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -27,11 +51,21 @@ def autodetect_decode(uploader):
     enc = chardet.detect(raw)["encoding"] or "utf-8"
     try:
         return raw.decode(enc)
-    except:
-        return raw.decode("utf-8", errors="ignore")
+    except Exception as e:
+        st.error(f"Could not decode file with encoding {enc}. Error: {e}")
+        return ""
 
 def parse_srt(text: str):
-    text = text.replace('\r\n', '\n')
+    """
+    Improved parser:
+    - Splits the file into blocks.
+    - For each block, splits the lines.
+    - Each line from the body is inspected:
+          * If it contains any Arabic character (Unicode range: U+0600 to U+06FF),
+            it's added to the Arabic lines list.
+          * Otherwise, it's added to the English lines list.
+    - The Arabic text is then the concatenation (separated by newlines) of all Arabic lines.
+    """
     blocks = re.split(r'\n\s*\n', text.strip())
     subs = []
     for blk in blocks:
@@ -41,11 +75,20 @@ def parse_srt(text: str):
         idx = lines[0].strip()
         start, end = [t.strip() for t in lines[1].split("-->")]
         body_lines = [l.strip() for l in lines[2:] if l.strip()]
-        arabic_lines = [l for l in body_lines if any('\u0600' <= ch <= '\u06FF' for ch in l)]
-        english_lines = [l for l in body_lines if not any('\u0600' <= ch <= '\u06FF' for ch in l)]
+        arabic_lines = []
+        english_lines = []
+        for line in body_lines:
+            if any('\u0600' <= ch <= '\u06FF' for ch in line):
+                arabic_lines.append(line)
+            else:
+                english_lines.append(line)
+        arabic = "\n".join(arabic_lines)
         subs.append({
-            "index": idx, "start": start, "end": end,
-            "english_lines": english_lines, "arabic": "\n".join(arabic_lines)
+            "index": idx,
+            "start": start,
+            "end": end,
+            "english_lines": english_lines,
+            "arabic": arabic
         })
     return subs
 
@@ -57,87 +100,83 @@ def build_srt(subs):
         out.append(f"{s['index']}\n{s['start']} --> {s['end']}\n{combined}")
     return "\n\n".join(out)
 
-def translate_batch(client, model_id, block_texts):
-    config = types.GenerateContentConfig(
-        system_instruction="Translate English subtitle blocks to natural Arabic. Maintain line breaks. Output translations preceded by [1], [2], etc.",
-        temperature=0.3,
+def translate_batch(block_texts: list[str]) -> list[str]:
+    prompt = (
+        "You are a professional translator. Translate the following English subtitle blocks into Arabic.\n"
+        "Keep the same line breaks for each block.\n"
+        "For each block, output ONLY the Arabic lines, without titles or extra text, just pure translation output.\n\n"
     )
-    prompt = "Translate these blocks:\n\n"
-    for i, txt in enumerate(block_texts, 1):
-        prompt += f"[{i}]\n{txt}\n\n"
-    response = client.models.generate_content(model=model_id, contents=prompt, config=config)
-    return [p.strip() for p in re.split(r'\[\d+\]', response.text.strip()) if p.strip()]
-
-# --- Session State ---
-if "subs" not in st.session_state:
-    st.session_state.subs = []
+    for i, blk in enumerate(block_texts, 1):
+        prompt += f"Block {i}:\n{blk}\n\n"
+    chat = model.start_chat(history=[])
+    resp = chat.send_message(prompt)
+    text = resp.text.strip()
+    # Return translations as a list (one per block)
+    return [b.strip() for b in text.split("\n\n") if b.strip()]
 
 # --- UI: File Upload ---
-uploader = st.file_uploader("Upload SRT file", type="srt")
-if uploader and not st.session_state.subs:
-    text = autodetect_decode(uploader)
-    st.session_state.subs = parse_srt(text)
-
-if not st.session_state.subs:
+uploader = st.file_uploader("Upload SRT file (Arabic+English or English-only)", type="srt")
+if not uploader:
     st.info("Please upload your SRT file.")
     st.stop()
 
-# --- Translation Logic ---
-if st.button("🚀 Translate Entire File (in batches)"):
-    raw_keys = [st.secrets.get(k) for k in ["gemini_api_key", "gemini_api_2", "gemini_api_3", "gemini_api_4"]]
-    api_keys = list(dict.fromkeys([k for k in raw_keys if k]))
-    
+text = autodetect_decode(uploader)
+subs = parse_srt(text)
+st.session_state.setdefault("subs", subs)
+
+# --- Translation: Entire File in Batches ---
+if st.button("Translate Entire File (in batches)"):
     pending_idxs = [i for i, s in enumerate(st.session_state.subs) if not s["arabic"].strip()]
+    total_pending = len(pending_idxs)
+    batch_size = 3  # Process 5 blocks per batch
+    progress_bar = st.progress(0)
+    status_text = st.empty()
     
-    if pending_idxs:
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        key_idx, current_progress = 0, 0
-        
-        while current_progress < len(pending_idxs):
-            client = genai.Client(api_key=api_keys[key_idx])
-            batch = pending_idxs[current_progress : current_progress + 12]
-            texts = ["\n".join(st.session_state.subs[i]["english_lines"]) for i in batch]
-            
-            try:
-                status_text.info(f"Translating: Blocks {st.session_state.subs[batch[0]]['index']} - {st.session_state.subs[batch[-1]]['index']}")
-                translations = translate_batch(client, DEFAULT_MODEL, texts)
-                
-                for i, idx in enumerate(batch):
-                    if i < len(translations):
-                        st.session_state.subs[idx]["arabic"] = translations[i]
-                
-                current_progress += len(batch)
-                progress_bar.progress(current_progress / len(pending_idxs))
-                time.sleep(10) # 10s buffer between successful calls
-            except Exception as e:
-                if any(x in str(e).lower() for x in ["quota", "429", "resource"]):
-                    st.warning(f"Key #{key_idx+1} limit hit. Rotating...")
-                    time.sleep(2)
-                    key_idx = (key_idx + 1) % len(api_keys)
-                else:
-                    st.error(f"Error: {e}")
-                    break
-        st.success("Translation complete!")
-        time.sleep(1)
-        st.rerun()
+    for batch_start in range(0, total_pending, batch_size):
+        current_batch = pending_idxs[batch_start:batch_start+batch_size]
+        texts = ["\n".join(st.session_state.subs[i]["english_lines"]) for i in current_batch]
+        status_text.info(f"Translating blocks: {current_batch} ...")
+        translations = translate_batch(texts)
+        for j, idx in enumerate(current_batch):
+            if j < len(translations):
+                st.session_state.subs[idx]["arabic"] = translations[j]
+        progress = min(1.0, (batch_start + batch_size) / total_pending)
+        progress_bar.progress(progress)
+        time.sleep(7)  # Wait 3 seconds between batches
+    progress_bar.progress(1.0)
+    status_text.success("Translation complete!")
+
+# --- Display Subtitle Blocks for Review ---
+st.write("### Subtitle Blocks")
+edited = []
+for i, s in enumerate(st.session_state.subs):
+    st.markdown("<div class='subtitle-block'>", unsafe_allow_html=True)
+    st.markdown(f"<div class='block-heading'>Block {s['index']}</div>", unsafe_allow_html=True)
+    c1, c2 = st.columns(2)
+    with c1:
+        start_time = st.text_input("Start", s["start"], key=f"start_{i}")
+        end_time = st.text_input("End", s["end"], key=f"end_{i}")
+    with c2:
+        arabic_text = st.text_area("Arabic", s["arabic"], key=f"arabic_{i}", height=80)
+        english_text = st.text_area("English", "\n".join(s["english_lines"]), key=f"english_{i}", height=80)
+    edited.append({
+        "index": s["index"],
+        "start": start_time,
+        "end": end_time,
+        "arabic": arabic_text,
+        "english_lines": english_text.splitlines()
+    })
+    st.markdown("</div>", unsafe_allow_html=True)
+st.session_state.subs = edited
 
 # --- Build & Download Section ---
-if st.button("📦 Build & Download SRT"):
+if st.button("Build & Download SRT"):
     final = build_srt(st.session_state.subs)
-    st.text_area("Final Preview", final, height=200)
-    st.download_button("Download .srt", final, file_name="translated.srt")
+    st.session_state["final_srt"] = final
 
-# --- Display Loop ---
-st.write("### Review Blocks")
-for i, s in enumerate(st.session_state.subs):
-    with st.container():
-        st.markdown(f"<div class='subtitle-block'><div class='block-heading'>Block {s['index']}</div>", unsafe_allow_html=True)
-        c1, c2 = st.columns(2)
-        with c1:
-            st.session_state.subs[i]["start"] = st.text_input("Start", s["start"], key=f"start_{i}")
-            st.session_state.subs[i]["end"] = st.text_input("End", s["end"], key=f"end_{i}")
-        with c2:
-            st.session_state.subs[i]["arabic"] = st.text_area("Arabic", s["arabic"], key=f"arabic_{i}", height=80)
-            st.session_state.subs[i]["english_lines"] = st.text_area("English", "\n".join(s["english_lines"]), key=f"english_{i}", height=80).splitlines()
-        st.markdown("</div>", unsafe_allow_html=True)
+if "final_srt" in st.session_state:
+    st.write("### Final Updated SRT Content")
+    final_content = st.text_area("SRT Content", st.session_state["final_srt"], height=300)
+    st.session_state["final_srt"] = final_content
+    st.download_button("Download .srt", final_content, "translated.srt", "text/plain")
+    
