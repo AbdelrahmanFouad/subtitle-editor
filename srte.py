@@ -59,7 +59,7 @@ def build_srt(subs):
 
 def translate_batch(client, model_id, block_texts):
     config = types.GenerateContentConfig(
-        system_instruction="Translate English subtitle blocks to natural Arabic. Output translations preceded by [1], [2], etc.",
+        system_instruction="Translate English subtitle blocks to natural Arabic. Maintain line breaks. Output translations preceded by [1], [2], etc.",
         temperature=0.3,
     )
     prompt = "Translate these blocks:\n\n"
@@ -109,15 +109,17 @@ if st.button("🚀 Translate Entire File (in batches)"):
                 
                 current_progress += len(batch)
                 progress_bar.progress(current_progress / len(pending_idxs))
-                time.sleep(10)
+                time.sleep(10) # 10s buffer between successful calls
             except Exception as e:
-                if "quota" in str(e).lower() or "429" in str(e).lower():
-                    key_idx = (key_idx + 1) % len(api_keys)
+                if any(x in str(e).lower() for x in ["quota", "429", "resource"]):
+                    st.warning(f"Key #{key_idx+1} limit hit. Rotating...")
                     time.sleep(2)
+                    key_idx = (key_idx + 1) % len(api_keys)
                 else:
                     st.error(f"Error: {e}")
                     break
-        st.success("Done! Scroll down to review.")
+        st.success("Translation complete!")
+        time.sleep(1)
         st.rerun()
 
 # --- Build & Download Section ---
@@ -126,14 +128,13 @@ if st.button("📦 Build & Download SRT"):
     st.text_area("Final Preview", final, height=200)
     st.download_button("Download .srt", final, file_name="translated.srt")
 
-# --- Display Loop (Fixed: No Overwriting) ---
-st.write("### Subtitle Blocks")
+# --- Display Loop ---
+st.write("### Review Blocks")
 for i, s in enumerate(st.session_state.subs):
     with st.container():
         st.markdown(f"<div class='subtitle-block'><div class='block-heading'>Block {s['index']}</div>", unsafe_allow_html=True)
         c1, c2 = st.columns(2)
         with c1:
-            # We update the session state directly from the widget return value
             st.session_state.subs[i]["start"] = st.text_input("Start", s["start"], key=f"start_{i}")
             st.session_state.subs[i]["end"] = st.text_input("End", s["end"], key=f"end_{i}")
         with c2:
