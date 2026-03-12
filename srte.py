@@ -7,7 +7,7 @@ import google.generativeai as genai
 
 # --- Configure Gemini API ---
 genai.configure(api_key=st.secrets["gemini_api_key"])
-model = genai.GenerativeModel(model_name="gemini-2.5-flash-lite")
+model = genai.GenerativeModel(model_name="gemini-2.0-flash")
 
 st.set_page_config(layout="wide")
 st.title("SRT Editor & Translator: English → Arabic (AI)")
