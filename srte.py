@@ -126,23 +126,46 @@ st.session_state.setdefault("subs", subs)
 
 # --- Translation: Entire File in Batches ---
 if st.button("Translate Entire File (in batches)"):
+    api_keys = [
+        st.secrets["gemini_api_key"],
+        st.secrets["gemini_api_2"],
+        st.secrets["gemini_api_3"],
+        st.secrets["gemini_api_4"],
+    ]
+    
     pending_idxs = [i for i, s in enumerate(st.session_state.subs) if not s["arabic"].strip()]
     total_pending = len(pending_idxs)
-    batch_size = 3  # Process 5 blocks per batch
+    batch_size = 3
     progress_bar = st.progress(0)
     status_text = st.empty()
     
+    current_key_index = -1
+
     for batch_start in range(0, total_pending, batch_size):
-        current_batch = pending_idxs[batch_start:batch_start+batch_size]
+        # Determine which key to use for this batch based on blocks processed
+        key_index_for_batch = (batch_start // 35) % len(api_keys)
+
+        if key_index_for_batch != current_key_index:
+            current_key_index = key_index_for_batch
+            genai.configure(api_key=api_keys[current_key_index])
+            status_text.info(f"Using API key #{current_key_index + 1}...")
+            time.sleep(1.5)  # Let user see the new key message
+
+        current_batch = pending_idxs[batch_start:batch_start + batch_size]
         texts = ["\n".join(st.session_state.subs[i]["english_lines"]) for i in current_batch]
-        status_text.info(f"Translating blocks: {current_batch} ...")
+        
+        block_numbers = [st.session_state.subs[i]['index'] for i in current_batch]
+        status_text.info(f"Translating blocks: {', '.join(block_numbers)} (using key #{current_key_index + 1})")
+        
         translations = translate_batch(texts)
+        
         for j, idx in enumerate(current_batch):
             if j < len(translations):
                 st.session_state.subs[idx]["arabic"] = translations[j]
         progress = min(1.0, (batch_start + batch_size) / total_pending)
         progress_bar.progress(progress)
-        time.sleep(7)  # Wait 3 seconds between batches
+        time.sleep(7)
+        
     progress_bar.progress(1.0)
     status_text.success("Translation complete!")
 
