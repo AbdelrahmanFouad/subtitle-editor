@@ -3,7 +3,8 @@ import re
 import time
 import chardet
 import streamlit as st
-import google.generativeai as genai
+import google.generai as genai
+from google.api_core import exceptions
 
 # --- Configure Gemini API ---
 genai.configure(api_key=st.secrets["gemini_api_key"])
@@ -66,7 +67,9 @@ def parse_srt(text: str):
           * Otherwise, it's added to the English lines list.
     - The Arabic text is then the concatenation (separated by newlines) of all Arabic lines.
     """
-    blocks = re.split(r'\n\s*\n', text.strip())
+    blocks = re.split(r'
+\s*
+', text.strip())
     subs = []
     for blk in blocks:
         lines = blk.splitlines()
@@ -82,7 +85,8 @@ def parse_srt(text: str):
                 arabic_lines.append(line)
             else:
                 english_lines.append(line)
-        arabic = "\n".join(arabic_lines)
+        arabic = "
+".join(arabic_lines)
         subs.append({
             "index": idx,
             "start": start,
@@ -95,24 +99,39 @@ def parse_srt(text: str):
 def build_srt(subs):
     out = []
     for s in subs:
-        combined = f"{s['arabic']}\n" if s['arabic'] else ""
-        combined += "\n".join(s["english_lines"])
-        out.append(f"{s['index']}\n{s['start']} --> {s['end']}\n{combined}")
-    return "\n\n".join(out)
+        combined = f"{s['arabic']}
+" if s['arabic'] else ""
+        combined += "
+".join(s["english_lines"])
+        out.append(f"{s['index']}
+{s['start']} --> {s['end']}
+{combined}")
+    return "
+
+".join(out)
 
 def translate_batch(block_texts: list[str]) -> list[str]:
     prompt = (
-        "You are a professional translator. Translate the following English subtitle blocks into Arabic.\n"
-        "Keep the same line breaks for each block.\n"
-        "For each block, output ONLY the Arabic lines, without titles or extra text, just pure translation output.\n\n"
+        "You are a professional translator. Translate the following English subtitle blocks into Arabic.
+"
+        "Keep the same line breaks for each block.
+"
+        "For each block, output ONLY the Arabic lines, without titles or extra text, just pure translation output.
+
+"
     )
     for i, blk in enumerate(block_texts, 1):
-        prompt += f"Block {i}:\n{blk}\n\n"
+        prompt += f"Block {i}:
+{blk}
+
+"
     chat = model.start_chat(history=[])
-    resp = chat.send_message(prompt)
+    resp = chat.send_message(prompt, request_options={"timeout": 120})
     text = resp.text.strip()
     # Return translations as a list (one per block)
-    return [b.strip() for b in text.split("\n\n") if b.strip()]
+    return [b.strip() for b in text.split("
+
+") if b.strip()]
 
 # --- UI: File Upload ---
 uploader = st.file_uploader("Upload SRT file (Arabic+English or English-only)", type="srt")
@@ -132,42 +151,70 @@ if st.button("Translate Entire File (in batches)"):
         st.secrets["gemini_api_3"],
         st.secrets["gemini_api_4"],
     ]
-    
+    key_index = 0
+    # Configure with the first key
+    genai.configure(api_key=api_keys[key_index])
+    st.info(f"Starting translation with API key #{key_index + 1}")
+
     pending_idxs = [i for i, s in enumerate(st.session_state.subs) if not s["arabic"].strip()]
     total_pending = len(pending_idxs)
     batch_size = 3
     progress_bar = st.progress(0)
     status_text = st.empty()
-    
-    current_key_index = -1
 
-    for batch_start in range(0, total_pending, batch_size):
-        # Determine which key to use for this batch based on blocks processed
-        key_index_for_batch = (batch_start // 35) % len(api_keys)
+    batch_start = 0
 
-        if key_index_for_batch != current_key_index:
-            current_key_index = key_index_for_batch
-            genai.configure(api_key=api_keys[current_key_index])
-            status_text.info(f"Using API key #{current_key_index + 1}...")
-            time.sleep(1.5)  # Let user see the new key message
+    while batch_start < total_pending:
+        current_batch_indices = pending_idxs[batch_start : batch_start + batch_size]
+        texts_to_translate = ["
+".join(st.session_state.subs[i]["english_lines"]) for i in current_batch_indices]
+        block_numbers = [st.session_state.subs[i]['index'] for i in current_batch_indices]
 
-        current_batch = pending_idxs[batch_start:batch_start + batch_size]
-        texts = ["\n".join(st.session_state.subs[i]["english_lines"]) for i in current_batch]
+        try:
+            status_text.info(f"Translating blocks: {', '.join(block_numbers)} (using key #{key_index + 1})")
+            
+            # This call will raise an exception on API failure
+            translations = translate_batch(texts_to_translate)
+
+            # --- Success Case ---
+            for i, idx in enumerate(current_batch_indices):
+                if i < len(translations):
+                    st.session_state.subs[idx]["arabic"] = translations[i]
+            
+            # Move to the next batch
+            batch_start += batch_size
+            progress = min(1.0, batch_start / total_pending)
+            progress_bar.progress(progress)
+            
+            if batch_start < total_pending:
+                time.sleep(7) # Keep the delay between successful calls
+
+        except exceptions.ResourceExhausted as e:
+            # --- Quota Failure Case ---
+            st.warning(f"Quota error on key #{key_index + 1}. Rotating to next key...")
+            time.sleep(1)
+            
+            key_index += 1
+            
+            if key_index >= len(api_keys):
+                st.error("All API keys have been exhausted. Please check your quota and billing details, then try again later. Aborting translation.")
+                break # Exit the while loop
+            
+            # Configure with new key and retry the same batch
+            genai.configure(api_key=api_keys[key_index])
+            st.info(f"Retrying with new API key #{key_index + 1}...")
+            time.sleep(1.5)
         
-        block_numbers = [st.session_state.subs[i]['index'] for i in current_batch]
-        status_text.info(f"Translating blocks: {', '.join(block_numbers)} (using key #{current_key_index + 1})")
-        
-        translations = translate_batch(texts)
-        
-        for j, idx in enumerate(current_batch):
-            if j < len(translations):
-                st.session_state.subs[idx]["arabic"] = translations[j]
-        progress = min(1.0, (batch_start + batch_size) / total_pending)
-        progress_bar.progress(progress)
-        time.sleep(7)
-        
-    progress_bar.progress(1.0)
-    status_text.success("Translation complete!")
+        except Exception as e:
+            # --- Other Failure Case ---
+            st.error(f"An unexpected error occurred: {e}. Aborting translation.")
+            break
+
+    if batch_start >= total_pending and total_pending > 0:
+        progress_bar.progress(1.0)
+        status_text.success("Translation complete!")
+    elif total_pending == 0:
+        st.info("No untranslated blocks found.")
 
 # --- Display Subtitle Blocks for Review ---
 st.write("### Subtitle Blocks")
@@ -181,7 +228,8 @@ for i, s in enumerate(st.session_state.subs):
         end_time = st.text_input("End", s["end"], key=f"end_{i}")
     with c2:
         arabic_text = st.text_area("Arabic", s["arabic"], key=f"arabic_{i}", height=80)
-        english_text = st.text_area("English", "\n".join(s["english_lines"]), key=f"english_{i}", height=80)
+        english_text = st.text_area("English", "
+".join(s["english_lines"]), key=f"english_{i}", height=80)
     edited.append({
         "index": s["index"],
         "start": start_time,
@@ -202,4 +250,3 @@ if "final_srt" in st.session_state:
     final_content = st.text_area("SRT Content", st.session_state["final_srt"], height=300)
     st.session_state["final_srt"] = final_content
     st.download_button("Download .srt", final_content, "translated.srt", "text/plain")
-    
