@@ -7,8 +7,9 @@ from google import genai
 from google.api_core import exceptions
 
 # --- Configure Gemini API ---
-# Note: Using the model ID provided in your error message
-MODEL_ID = "gemini-2.0-flash-lite" 
+# gemini-3.1-flash is the stable version as of March 2026.
+# Using the stable ID for maximum longevity and highest free-tier quota.
+MODEL_ID = "gemini-3.1-flash" 
 
 if "client" not in st.session_state:
     st.session_state.client = genai.Client(api_key=st.secrets["gemini_api_key"])
@@ -95,7 +96,6 @@ def build_srt(subs):
     return "\n\n".join(out)
 
 def translate_batch(block_texts: list[str]) -> list[str]:
-    # Optimized prompt for batching
     prompt = (
         "Translate these English subtitle blocks to Arabic. "
         "Maintain line breaks. Output ONLY the Arabic text for each block, separated by double newlines. "
@@ -109,7 +109,6 @@ def translate_batch(block_texts: list[str]) -> list[str]:
         contents=prompt
     )
     text = response.text.strip()
-    # Handle various possible delimiters from the model
     parts = [p.strip() for p in text.split("\n\n") if p.strip()]
     return parts
 
@@ -124,7 +123,7 @@ subs = parse_srt(text)
 st.session_state.setdefault("subs", subs)
 
 # --- Translation: Entire File in Batches ---
-if st.button("Translate Entire File (Optimized Batches)"):
+if st.button("Translate Entire File (Stable Rotation)"):
     api_keys = [
         st.secrets["gemini_api_key"],
         st.secrets["gemini_api_2"],
@@ -136,11 +135,12 @@ if st.button("Translate Entire File (Optimized Batches)"):
     
     pending_idxs = [i for i, s in enumerate(st.session_state.subs) if not s["arabic"].strip()]
     total_pending = len(pending_idxs)
-    batch_size = 12  # INCREASED: Fewer requests = fewer quota hits
+    batch_size = 12
     progress_bar = st.progress(0)
     status_text = st.empty()
 
     batch_start = 0
+    failure_count = 0
 
     while batch_start < total_pending:
         current_batch_indices = pending_idxs[batch_start : batch_start + batch_size]
@@ -148,14 +148,11 @@ if st.button("Translate Entire File (Optimized Batches)"):
         block_numbers = [st.session_state.subs[i]['index'] for i in current_batch_indices]
 
         try:
-            status_text.info(f"Translating blocks: {block_numbers[0]} to {block_numbers[-1]} (Key #{key_index + 1})")
+            status_text.info(f"Translating: Blocks {block_numbers[0]}-{block_numbers[-1]} | Key #{key_index + 1}")
             
             translations = translate_batch(texts_to_translate)
 
-            # Verification logic to handle model output mismatches
             if len(translations) < len(current_batch_indices):
-                st.warning(f"Batch mismatch (expected {len(current_batch_indices)}, got {len(translations)}). Reducing batch size for this turn...")
-                # Temporary fallback: process a smaller chunk if the model gets confused
                 temp_batch_size = max(1, len(translations))
                 current_batch_indices = current_batch_indices[:temp_batch_size]
                 translations = translations[:temp_batch_size]
@@ -166,26 +163,33 @@ if st.button("Translate Entire File (Optimized Batches)"):
             batch_start += len(current_batch_indices)
             progress = min(1.0, batch_start / total_pending)
             progress_bar.progress(progress)
+            failure_count = 0 
             
             if batch_start < total_pending:
-                time.sleep(10) # Safe buffer between successful calls
+                time.sleep(12) 
 
         except Exception as e:
             error_str = str(e).lower()
+            failure_count += 1
+            
             if "quota" in error_str or "429" in error_str or "resourceexhausted" in error_str:
-                st.warning(f"Quota hit on key #{key_index + 1}. Entering 30s cooldown...")
-                time.sleep(30) # COOLDOWN: Let the per-minute limit reset
-                
-                key_index = (key_index + 1) % len(api_keys) # LOOP BACK to key 1 if needed
+                key_index = (key_index + 1) % len(api_keys)
                 st.session_state.client = genai.Client(api_key=api_keys[key_index])
-                st.info(f"Switched to Key #{key_index + 1}. Retrying...")
+                
+                # Wait 60 seconds to ensure the RPM limit for the key has definitely reset
+                wait_time = 60 if failure_count < len(api_keys) else 120
+                st.warning(f"Key #{((key_index - 1) % 4) + 1} limited. Waiting {wait_time}s then trying Key #{key_index + 1}...")
+                time.sleep(wait_time)
             else:
-                st.error(f"Error: {e}. Retrying in 5s...")
-                time.sleep(5)
+                st.error(f"Error: {e}. Retrying in 10s...")
+                time.sleep(10)
+                if failure_count > 5:
+                    st.error("Too many consecutive errors. Stopping.")
+                    break
 
     if batch_start >= total_pending and total_pending > 0:
         progress_bar.progress(1.0)
-        status_text.success("Translation complete!")
+        status_text.success("All blocks translated!")
 
 # --- Review & Download ---
 st.write("### Subtitle Blocks")
