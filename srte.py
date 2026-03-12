@@ -7,7 +7,7 @@ import google.generativeai as genai
 
 # --- Configure Gemini API ---
 genai.configure(api_key=st.secrets["gemini_api_key"])
-model = genai.GenerativeModel(model_name="gemini-2.0-flash")
+model = genai.GenerativeModel(model_name="gemini-2.5-flash-lite")
 
 st.set_page_config(layout="wide")
 st.title("SRT Editor & Translator: English → Arabic (AI)")
@@ -128,7 +128,7 @@ st.session_state.setdefault("subs", subs)
 if st.button("Translate Entire File (in batches)"):
     pending_idxs = [i for i, s in enumerate(st.session_state.subs) if not s["arabic"].strip()]
     total_pending = len(pending_idxs)
-    batch_size = 4  # Process 5 blocks per batch
+    batch_size = 3  # Process 5 blocks per batch
     progress_bar = st.progress(0)
     status_text = st.empty()
     
@@ -142,7 +142,7 @@ if st.button("Translate Entire File (in batches)"):
                 st.session_state.subs[idx]["arabic"] = translations[j]
         progress = min(1.0, (batch_start + batch_size) / total_pending)
         progress_bar.progress(progress)
-        time.sleep(4)  # Wait 3 seconds between batches
+        time.sleep(7)  # Wait 3 seconds between batches
     progress_bar.progress(1.0)
     status_text.success("Translation complete!")
 
