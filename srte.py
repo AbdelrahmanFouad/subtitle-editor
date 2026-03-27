@@ -7,7 +7,7 @@ from google import genai
 from google.genai import types
 
 # --- Configure Gemini API ---
-DEFAULT_MODEL = "gemini-2.5-flash" 
+MODELS = ["gemini-2.0-flash", "gemini-2.5-flash", "gemini-3-flash-preview"]
 
 st.set_page_config(layout="wide")
 st.title("SRT Editor & Translator: English → Arabic (AI)")
@@ -97,16 +97,21 @@ if st.button("🚀 Translate Entire File (in batches)"):
     if pending_idxs:
         progress_bar = st.progress(0)
         status_text = st.empty()
-        key_idx, current_progress = 0, 0
+        key_idx = 0
+        model_idx = 0
+        current_progress = 0
         
         while current_progress < len(pending_idxs):
-            client = genai.Client(api_key=api_keys[key_idx])
+            current_key = api_keys[key_idx]
+            current_model = MODELS[model_idx]
+            
+            client = genai.Client(api_key=current_key)
             batch = pending_idxs[current_progress : current_progress + 12]
             texts = ["\n".join(st.session_state.subs[i]["english_lines"]) for i in batch]
             
             try:
-                status_text.info(f"Using Key #{key_idx+1} | Translating Blocks {st.session_state.subs[batch[0]]['index']} - {st.session_state.subs[batch[-1]]['index']}")
-                translations = translate_batch(client, DEFAULT_MODEL, texts)
+                status_text.info(f"Key #{key_idx+1} | Model: {current_model} | Blocks {st.session_state.subs[batch[0]]['index']} - {st.session_state.subs[batch[-1]]['index']}")
+                translations = translate_batch(client, current_model, texts)
                 
                 for i, idx in enumerate(batch):
                     if i < len(translations):
@@ -120,14 +125,22 @@ if st.button("🚀 Translate Entire File (in batches)"):
                 time.sleep(10)
             except Exception as e:
                 err_str = str(e).lower()
-                if any(x in err_str for x in ["quota", "429", "resource", "limit"]):
-                    st.warning(f"Key #{key_idx+1} limit hit. Rotating...")
-                    key_idx = (key_idx + 1) % len(api_keys)
-                    time.sleep(2)
+                if any(x in err_str for x in ["quota", "429", "resource", "limit", "not found", "unsupported"]):
+                    st.warning(f"Key #{key_idx+1} failed with {current_model}. Trying fallback...")
+                    # Try next model for the same key
+                    model_idx += 1
+                    if model_idx >= len(MODELS):
+                        # All models for this key failed, move to next key and reset model
+                        st.error(f"Key #{key_idx+1} exhausted. Rotating key...")
+                        model_idx = 0
+                        key_idx = (key_idx + 1) % len(api_keys)
+                        time.sleep(2)
+                    continue # Retry same batch with new combination
                 else:
-                    st.error(f"Error with Key #{key_idx+1}: {e}")
-                    # Rotate even on general errors to try another key
+                    st.error(f"Error with Key #{key_idx+1} ({current_model}): {e}")
+                    # Rotate even on general errors
                     key_idx = (key_idx + 1) % len(api_keys)
+                    model_idx = 0
                     time.sleep(5)
         st.success("Done!")
         time.sleep(1)
