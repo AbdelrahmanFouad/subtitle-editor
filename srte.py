@@ -84,9 +84,14 @@ if not st.session_state.subs:
 
 # --- Translation Logic ---
 if st.button("🚀 Translate Entire File (in batches)"):
-    raw_keys = [st.secrets.get(k) for k in ["gemini_api_key", "gemini_api_2", "gemini_api_3", "gemini_api_4"]]
+    # Dynamically gather all keys starting with 'gemini_api' from secrets
+    raw_keys = [val for key, val in st.secrets.items() if key.startswith("gemini_api")]
     api_keys = list(dict.fromkeys([k for k in raw_keys if k]))
     
+    if not api_keys:
+        st.error("No API keys found in secrets. Please check your configuration.")
+        st.stop()
+        
     pending_idxs = [i for i, s in enumerate(st.session_state.subs) if not s["arabic"].strip()]
     
     if pending_idxs:
@@ -100,7 +105,7 @@ if st.button("🚀 Translate Entire File (in batches)"):
             texts = ["\n".join(st.session_state.subs[i]["english_lines"]) for i in batch]
             
             try:
-                status_text.info(f"Translating: Blocks {st.session_state.subs[batch[0]]['index']} - {st.session_state.subs[batch[-1]]['index']}")
+                status_text.info(f"Using Key #{key_idx+1} | Translating Blocks {st.session_state.subs[batch[0]]['index']} - {st.session_state.subs[batch[-1]]['index']}")
                 translations = translate_batch(client, DEFAULT_MODEL, texts)
                 
                 for i, idx in enumerate(batch):
@@ -114,13 +119,16 @@ if st.button("🚀 Translate Entire File (in batches)"):
                 progress_bar.progress(current_progress / len(pending_idxs))
                 time.sleep(10)
             except Exception as e:
-                if any(x in str(e).lower() for x in ["quota", "429", "resource"]):
+                err_str = str(e).lower()
+                if any(x in err_str for x in ["quota", "429", "resource", "limit"]):
                     st.warning(f"Key #{key_idx+1} limit hit. Rotating...")
-                    time.sleep(2)
                     key_idx = (key_idx + 1) % len(api_keys)
+                    time.sleep(2)
                 else:
-                    st.error(f"Error: {e}")
-                    break
+                    st.error(f"Error with Key #{key_idx+1}: {e}")
+                    # Rotate even on general errors to try another key
+                    key_idx = (key_idx + 1) % len(api_keys)
+                    time.sleep(5)
         st.success("Done!")
         time.sleep(1)
         st.rerun()
