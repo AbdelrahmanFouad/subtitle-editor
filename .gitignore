@@ -1,0 +1,20 @@
+# Secrets
+.streamlit/secrets.toml
+
+# Output files (do not commit translations)
+fixed_translations/
+new_srt/
+translated_srt/
+*.zip
+config.toml
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
+.devcontainer/
