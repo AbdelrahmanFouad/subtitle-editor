@@ -1,96 +1,101 @@
-# SRT Editor & AI Translator
+# 🌐 SRT AI Translator — English → Arabic
 
-A Streamlit web app for editing SRT subtitle files and translating them from **English → Arabic** using the Gemini AI API — with automatic key rotation, model fallback, and batch processing.
+A Streamlit web app for **editing SRT subtitle files** and **translating them from English to Arabic** using Google Gemini AI — with multi-key rotation, model fallback, and batch processing.
 
-[![Open in Streamlit](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://subtitle-editor.streamlit.app)
+> 🌐 **Live App:** [Deployed on Streamlit Community Cloud](https://subtitle-editor.streamlit.app)
 
-## ✨ Features
+## How It Works
 
-- **Upload & Parse SRT** — load any `.srt` file with automatic encoding detection (handles UTF-8, Arabic encodings, etc.)
-- **Side-by-side Editor** — review and manually edit both English source and Arabic translation for every subtitle block
-- **AI Batch Translation** — translates the entire file in batches of 12 blocks per API call using Google Gemini
-- **Multi-key Rotation** — automatically rotates between multiple Gemini API keys when quota is exhausted
-- **Model Fallback Chain** — cycles through `gemini-2.0-flash → gemini-2.5-flash → gemini-3-flash` if a model fails
-- **Build & Download** — reconstruct and download the final bilingual `.srt` file in one click
-- **Stateful Session** — edits are preserved across re-runs via Streamlit session state
+```
+Upload .srt file
+       │
+       ▼
+┌──────────────────────────────────┐
+│  1. Smart SRT Parser             │
+│     • Auto-detect encoding       │  chardet → UTF-8, Arabic, BOM handling
+│     • Splits English vs Arabic   │  Unicode range detection (\u0600–\u06FF)
+│     • Preserves timestamps       │
+└──────────────┬───────────────────┘
+               ▼
+┌──────────────────────────────────┐
+│  2. AI Batch Translation         │  Google Gemini API
+│     • 12 blocks per API call     │
+│     • Multi-key rotation         │  Cycles through N API keys
+│     • Model fallback chain:      │
+│       gemini-2.0-flash           │
+│       → gemini-2.5-flash         │
+│       → gemini-3-flash-preview   │
+│     • Auto-retry on 429/quota    │
+│     • Progress bar tracking      │
+└──────────────┬───────────────────┘
+               ▼
+┌──────────────────────────────────┐
+│  3. Interactive Review           │
+│     • Side-by-side EN → AR       │
+│     • Edit any block inline      │
+│     • Adjust timestamps          │
+│     • Build & download .srt      │
+└──────────────────────────────────┘
+```
+
+## ✨ Key Features
+
+| Feature | Detail |
+|---------|--------|
+| **Multi-Key Rotation** | Dynamically reads all `gemini_api*` keys from Streamlit secrets — rotates automatically when one hits quota |
+| **Model Fallback Chain** | `gemini-2.0-flash` → `gemini-2.5-flash` → `gemini-3-flash-preview` — if a model fails, tries the next |
+| **Batch Translation** | Processes 12 subtitle blocks per API call for efficiency, with `[1]`, `[2]` indexed parsing |
+| **Arabic Detection** | Uses Unicode range `U+0600–U+06FF` to separate existing Arabic lines from English lines |
+| **Encoding Detection** | `chardet` auto-detects file encoding — handles BOM markers, UTF-8, Latin-1 |
+| **Inline Editing** | Every block is editable — timestamps, English text, Arabic translation |
+| **Rate Limit Handling** | Catches 429, quota, and "resource exhausted" errors → rotates key/model and retries |
+
+---
+
+### `sync_timestamps.py` — SRT Timestamp Synchronizer *(CLI)*
+
+When you translate subtitles and the timestamps drift, this script **copies timestamps from a reference SRT** into a translated SRT by matching English text lines.
+
+```bash
+python sync_timestamps.py new_srt_dir/ translated_srt_dir/ --out-dir fixed/
+```
+
+**How it works:**
+- Parses both SRT files, filters out Arabic lines for matching
+- Normalizes whitespace and builds a text → timestamp lookup
+- Replaces timestamps in the translated file where English text matches
+- Handles duplicates and BOM markers gracefully
+
+---
 
 ## 🚀 Quick Start
 
-### Prerequisites
-
 ```bash
-pip install -r requirements.txt
-```
+pip install streamlit chardet google-genai
 
-### Configure API Keys
+# .streamlit/secrets.toml:
+# gemini_api_1 = "key_1"
+# gemini_api_2 = "key_2"
+# gemini_api_3 = "key_3"
 
-Create `.streamlit/secrets.toml`:
-
-```toml
-gemini_api_1 = "AIzaSy..."
-gemini_api_2 = "AIzaSy..."   # optional: add more for rotation
-```
-
-### Run
-
-```bash
 streamlit run srte.py
-```
-
-Then open [http://localhost:8501](http://localhost:8501) and upload your `.srt` file.
-
-## 🔄 Translation Workflow
-
-```
-Upload .srt
-     │
-     ▼
-parse_srt()          ← splits into blocks, detects Arabic/English lines
-     │
-     ▼
-translate_batch()    ← sends 12 blocks per Gemini API call
-     │
-  ┌──┴──────────────────────────┐
-  │ Quota error?                │
-  │  → try next model           │
-  │ All models failed?          │
-  │  → rotate to next API key   │
-  └─────────────────────────────┘
-     │
-     ▼
-Session state updated → UI reflects new Arabic translations
-     │
-     ▼
-build_srt() → bilingual .srt download
-```
-
-## 📁 File Structure
-
-```
-subtitle-editor/
-├── srte.py              # Main Streamlit app
-├── split.py             # SRT file splitter utility
-├── requirements.txt
-└── .streamlit/
-    └── secrets.toml     # API keys (not committed)
 ```
 
 ## 📋 Requirements
 
 ```
 streamlit
-google-genai
 chardet
+google-genai
 ```
 
 ## 💡 Future Ideas
 
-- [ ] Support additional language pairs (Arabic → English, French → Arabic)
-- [ ] Timestamp offset correction tool
-- [ ] Batch upload multiple SRT files
-- [ ] Export to `.vtt` (WebVTT) format
-- [ ] Confidence scoring per translation block
+- [ ] Support for additional target languages (French, Spanish, Turkish)
+- [ ] VTT and ASS subtitle format support
+- [ ] Bulk file upload (process entire season of subtitles)
+- [ ] Side-by-side video preview with synced subtitles
 
 ---
 
-> Originally built for translating Arabic music video subtitles at scale — handling hundreds of subtitle files with minimal manual effort.
+> Built for Arabic content localization — translating hundreds of subtitle files per week for music video and documentary distribution.
