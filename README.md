@@ -2,7 +2,7 @@
 
 A Streamlit web app for **editing SRT subtitle files** and **translating them from English to Arabic** using Google Gemini AI — with multi-key rotation, model fallback, and batch processing.
 
-> 🌐 **Live App:** [Deployed on Streamlit Community Cloud](https://subtitle-editor.streamlit.app)
+> 🌐 **Live App:** [Deployed on Streamlit Community Cloud](https://subtitleditor.streamlit.app)
 
 ## How It Works
 
