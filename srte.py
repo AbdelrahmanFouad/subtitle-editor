@@ -7,7 +7,7 @@ from google import genai
 from google.genai import types
 
 # --- Configure Gemini API ---
-MODELS = ["gemini-2.0-flash", "gemini-2.5-flash", "gemini-3-flash-preview"]
+MODELS = ["gemini-2.5-flash-lite", "gemini-3.1-flash-lite-preview", "gemini-2.5-flash", "gemini-3-flash-preview"]
 
 st.set_page_config(layout="wide")
 st.title("SRT Editor & Translator: English → Arabic (AI)")
