@@ -49,13 +49,9 @@ def autodetect_decode(uploader):
 
 def parse_srt(text: str):
     """Robust SRT parser that handles malformed blocks and Arabic/English line splitting."""
-    text = text.replace('
-', '
-')
+    text = text.replace('\r\n', '\n')
     # Split by the standard SRT blank line pattern
-    blocks = re.split(r'
-\s*
-', text.strip())
+    blocks = re.split(r'\n\s*\n', text.strip())
     subs = []
     
     for blk in blocks:
@@ -78,8 +74,7 @@ def parse_srt(text: str):
             "start": start,
             "end": end,
             "english_lines": english,
-            "arabic": "
-".join(arabic)
+            "arabic": "\n".join(arabic)
         })
     return subs
 
@@ -87,16 +82,10 @@ def build_srt(subs):
     """Reconstructs the SRT file structure."""
     out = []
     for s in subs:
-        combined = f"{s['arabic']}
-" if s.get('arabic') else ""
-        combined += "
-".join(s["english_lines"])
-        out.append(f"{s['index']}
-{s['start']} --> {s['end']}
-{combined}")
-    return "
-
-".join(out)
+        combined = f"{s['arabic']}\n" if s.get('arabic') else ""
+        combined += "\n".join(s["english_lines"])
+        out.append(f"{s['index']}\n{s['start']} --> {s['end']}\n{combined}")
+    return "\n\n".join(out)
 
 def translate_batch(client, model_id, block_texts):
     """Calls Gemini API with strict system instructions and formatting."""
@@ -109,14 +98,9 @@ def translate_batch(client, model_id, block_texts):
         temperature=0.2,
     )
     
-    prompt = "Translate these subtitle blocks:
-
-"
+    prompt = "Translate these subtitle blocks:\n\n"
     for i, txt in enumerate(block_texts, 1):
-        prompt += f"[{i}]
-{txt}
-
-"
+        prompt += f"[{i}]\n{txt}\n\n"
     
     response = client.models.generate_content(
         model=model_id, 
@@ -201,8 +185,7 @@ if col_action.button("🚀 Auto-Translate All (Batch Mode)"):
             
             while pending:
                 current_batch_idxs = pending[:BATCH_SIZE]
-                texts = ["
-".join(st.session_state.subs[i]["english_lines"]) for i in current_batch_idxs]
+                texts = ["\n".join(st.session_state.subs[i]["english_lines"]) for i in current_batch_idxs]
                 
                 try:
                     client = genai.Client(api_key=api_keys[key_idx])
@@ -273,8 +256,7 @@ for i in range(start_idx, end_idx):
         st.markdown(f"<div class='subtitle-block'><div class='block-idx'># {s['index']} ({s['start']} → {s['end']})</div>", unsafe_allow_html=True)
         c1, c2 = st.columns(2)
         with c1:
-            eng_text = "
-".join(s["english_lines"])
+            eng_text = "\n".join(s["english_lines"])
             new_eng = st.text_area("English Source", eng_text, key=f"eng_{i}", height=100)
             st.session_state.subs[i]["english_lines"] = new_eng.splitlines()
         with c2:
