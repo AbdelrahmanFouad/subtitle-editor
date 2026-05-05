@@ -9,10 +9,10 @@ from google.genai import types
 # --- Configuration ---
 # Models sorted by preference (Fast/Cheap -> High Quality)
 MODELS = [
-    "gemini-2.0-flash-lite", 
-    "gemini-2.0-flash", 
-    "gemini-1.5-flash", 
-    "gemini-1.5-pro"
+    "gemini-2.5-flash-lite", 
+    "gemini-2.5-flash", 
+    "gemini-3.0-flash", 
+    "gemini-3.1-flash-lite-preview"
 ]
 BATCH_SIZE = 12  # Optimal for balancing context window and speed
 PAGE_SIZE = 25   # How many blocks to show in the UI at once to prevent lag
