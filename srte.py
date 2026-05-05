@@ -7,17 +7,17 @@ from google import genai
 from google.genai import types
 
 # --- Configuration ---
-# Models sorted by preference (Fast/Cheap -> High Quality)
+# Reverted to your futuristic 2026 model list
 MODELS = [
     "gemini-2.5-flash-lite", 
+    "gemini-3.1-flash-lite-preview", 
     "gemini-2.5-flash", 
-    "gemini-3.0-flash", 
-    "gemini-3.1-flash-lite-preview"
+    "gemini-3-flash-preview"
 ]
 BATCH_SIZE = 12  # Optimal for balancing context window and speed
 PAGE_SIZE = 25   # How many blocks to show in the UI at once to prevent lag
 
-st.set_page_config(page_title="Pro SRT Translator", layout="wide")
+st.set_page_config(page_title="Pro SRT AI Translator", layout="wide")
 
 # --- CSS Styling ---
 st.markdown("""
@@ -95,14 +95,14 @@ def translate_batch(client, model_id, block_texts):
             "Maintain line breaks and speaker dashes (-). "
             "Output format MUST be: [1] Translation [2] Translation... No extra text."
         ),
-        temperature=0.2, # Lower temperature for consistency
+        temperature=0.2,
     )
     
     prompt = "Translate these subtitle blocks:\n\n"
     for i, txt in enumerate(block_texts, 1):
         prompt += f"[{i}]\n{txt}\n\n"
     
-    # http_options timeout at 60s to prevent hang
+    # 60s timeout to prevent hang
     response = client.models.generate_content(
         model=model_id, 
         contents=prompt, 
@@ -111,7 +111,6 @@ def translate_batch(client, model_id, block_texts):
     )
     
     # Extract blocks using regex
-    # Looks for [1], [2] etc and captures text until next bracket
     results = re.split(r'\[\d+\]', response.text.strip())
     return [r.strip() for l in results if (r := l.strip())]
 
@@ -150,14 +149,12 @@ if not st.session_state.subs:
 # --- Batch Translation Engine ---
 col_action, col_empty = st.columns([1, 3])
 if col_action.button("🚀 Auto-Translate All (Batch Mode)"):
-    # 1. Gather all unique API keys from secrets
     raw_keys = [val for key, val in st.secrets.items() if key.startswith("gemini_api")]
     api_keys = list(dict.fromkeys([k for k in raw_keys if k]))
     
     if not api_keys:
         st.error("No API keys found. Add gemini_api_1, gemini_api_2 etc. to Streamlit secrets.")
     else:
-        # Get untranslated indices
         pending = [i for i, s in enumerate(st.session_state.subs) if not s["arabic"].strip()]
         
         if not pending:
@@ -166,31 +163,33 @@ if col_action.button("🚀 Auto-Translate All (Batch Mode)"):
             progress_bar = st.progress(0)
             status = st.empty()
             
-            k_idx, m_idx = 0, 0 # Rotation pointers
+            key_idx = 0
+            model_idx = 0 
             
             while pending:
                 current_batch_idxs = pending[:BATCH_SIZE]
                 texts = ["\n".join(st.session_state.subs[i]["english_lines"]) for i in current_batch_idxs]
                 
                 try:
-                    client = genai.Client(api_key=api_keys[k_idx])
-                    model_name = MODELS[m_idx]
-                    status.info(f"⚡ Translating with {model_name} (Key #{k_idx+1}) | {len(pending)} left...")
+                    client = genai.Client(api_key=api_keys[key_idx])
+                    model_name = MODELS[model_idx]
+                    status.info(f"⚡ Batch: {len(pending)} left | Key #{key_idx+1} | Model: {model_name}")
                     
                     results = translate_batch(client, model_name, texts)
                     
+                    if not results:
+                        raise ValueError("AI returned empty results.")
+
                     # Map results back to state
-                    # CRITICAL: Only move forward by what the AI actually returned
                     num_saved = 0
                     for i, trans_text in enumerate(results):
                         if i >= len(current_batch_idxs): break
                         real_idx = current_batch_idxs[i]
                         st.session_state.subs[real_idx]["arabic"] = trans_text
-                        # Also update form state to match
                         st.session_state[f"arabic_{real_idx}"] = trans_text
                         num_saved += 1
                     
-                    # Update pending list
+                    # Update pending list only by successful count
                     pending = pending[num_saved:]
                     
                     # Update UI progress
@@ -198,25 +197,27 @@ if col_action.button("🚀 Auto-Translate All (Batch Mode)"):
                     done = total - len(pending)
                     progress_bar.progress(done / total)
                     
-                    time.sleep(1) # Micro-throttle to avoid instant 429
+                    time.sleep(1) 
                     
                 except Exception as e:
-                    err = str(e).lower()
-                    status.warning(f"⚠️ {model_name} failed. Rotating to next candidate...")
+                    # Capture full error for debugging
+                    err_detail = str(e)
+                    status.warning(f"⚠️ Error with {MODELS[model_idx]} on Key #{key_idx+1}: {err_detail[:150]}...")
                     
-                    # THE INTELLIGENT ROTATION LOGIC:
-                    # Try next model in the list for the current key
-                    m_idx += 1
-                    if m_idx >= len(MODELS):
-                        # All models on this key failed, move to next key
-                        m_idx = 0
-                        k_idx = (k_idx + 1) % len(api_keys)
-                        status.error(f"🔄 Key #{k_idx} exhausted. Switching API Key...")
+                    # ROTATION LOGIC:
+                    # 1. Try next model for current key
+                    model_idx += 1
+                    
+                    # 2. If all 4 models exhausted, move to next key
+                    if model_idx >= len(MODELS):
+                        st.error(f"❌ Key #{key_idx+1} exhausted for all 4 models. Rotating Key...")
+                        model_idx = 0
+                        key_idx = (key_idx + 1) % len(api_keys)
                         time.sleep(5)
                     else:
                         time.sleep(2)
                     
-                    # continue keeps the same 'current_batch_idxs' for the next loop attempt
+                    # continue to retry the same batch with new setup
                     continue 
 
             status.success("✨ Translation complete!")
@@ -225,7 +226,6 @@ if col_action.button("🚀 Auto-Translate All (Batch Mode)"):
 st.divider()
 
 # --- Paginated Editor ---
-# This prevents Streamlit from crashing on large files by only rendering 25 blocks at a time
 total_pages = (len(st.session_state.subs) // PAGE_SIZE) + 1
 page = st.select_slider("Page Navigation", options=range(total_pages), value=st.session_state.page)
 st.session_state.page = page
@@ -239,12 +239,10 @@ for i in range(start_idx, end_idx):
         st.markdown(f"<div class='subtitle-block'><div class='block-idx'># {s['index']} ({s['start']} → {s['end']})</div>", unsafe_allow_html=True)
         c1, c2 = st.columns(2)
         with c1:
-            # English (Read Only for reference, or Editable if needed)
             eng_text = "\n".join(s["english_lines"])
             new_eng = st.text_area("English Source", eng_text, key=f"eng_{i}", height=100)
             st.session_state.subs[i]["english_lines"] = new_eng.splitlines()
         with c2:
-            # Arabic Translation
             new_arabic = st.text_area("Arabic Translation", s["arabic"], key=f"arabic_{i}", height=100)
             st.session_state.subs[i]["arabic"] = new_arabic
         st.markdown("</div>", unsafe_allow_html=True)
@@ -259,4 +257,4 @@ if st.button("📦 Finalize & Download SRT"):
         file_name="translated_output.srt",
         mime="text/plain"
     )
-    st.success("File generated! Check your downloads.")
+    st.success("File generated!")
