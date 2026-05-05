@@ -106,7 +106,6 @@ def translate_batch(client, model_id, block_texts):
         model=model_id, 
         contents=prompt, 
         config=config,
-        request_options={'timeout': 60} # Set a 60-second timeout
     )
     
     # Extract blocks using regex
