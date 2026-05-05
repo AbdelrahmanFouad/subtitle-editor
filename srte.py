@@ -49,9 +49,13 @@ def autodetect_decode(uploader):
 
 def parse_srt(text: str):
     """Robust SRT parser that handles malformed blocks and Arabic/English line splitting."""
-    text = text.replace('\r\n', '\n')
+    text = text.replace('
+', '
+')
     # Split by the standard SRT blank line pattern
-    blocks = re.split(r'\n\s*\n', text.strip())
+    blocks = re.split(r'
+\s*
+', text.strip())
     subs = []
     
     for blk in blocks:
@@ -74,7 +78,8 @@ def parse_srt(text: str):
             "start": start,
             "end": end,
             "english_lines": english,
-            "arabic": "\n".join(arabic)
+            "arabic": "
+".join(arabic)
         })
     return subs
 
@@ -82,10 +87,16 @@ def build_srt(subs):
     """Reconstructs the SRT file structure."""
     out = []
     for s in subs:
-        combined = f"{s['arabic']}\n" if s.get('arabic') else ""
-        combined += "\n".join(s["english_lines"])
-        out.append(f"{s['index']}\n{s['start']} --> {s['end']}\n{combined}")
-    return "\n\n".join(out)
+        combined = f"{s['arabic']}
+" if s.get('arabic') else ""
+        combined += "
+".join(s["english_lines"])
+        out.append(f"{s['index']}
+{s['start']} --> {s['end']}
+{combined}")
+    return "
+
+".join(out)
 
 def translate_batch(client, model_id, block_texts):
     """Calls Gemini API with strict system instructions and formatting."""
@@ -98,15 +109,20 @@ def translate_batch(client, model_id, block_texts):
         temperature=0.2,
     )
     
-    prompt = "Translate these subtitle blocks:\n\n"
+    prompt = "Translate these subtitle blocks:
+
+"
     for i, txt in enumerate(block_texts, 1):
-        prompt += f"[{i}]\n{txt}\n\n"
+        prompt += f"[{i}]
+{txt}
+
+"
     
-    # 60s timeout to prevent hang
     response = client.models.generate_content(
         model=model_id, 
         contents=prompt, 
-        config=config
+        config=config,
+        request_options={'timeout': 60} # Set a 60-second timeout
     )
     
     # Extract blocks using regex
@@ -118,25 +134,43 @@ if "subs" not in st.session_state:
     st.session_state.subs = []
 if "page" not in st.session_state:
     st.session_state.page = 0
+if "uploaded_filename" not in st.session_state: # Track uploaded file
+    st.session_state.uploaded_filename = None
 
 # --- Sidebar & File Input ---
 with st.sidebar:
     st.header("⚙️ Settings")
     uploader = st.file_uploader("Upload English SRT", type="srt")
     if uploader:
-        if st.button("🔄 Reload File"):
-            st.session_state.subs = parse_srt(autodetect_decode(uploader))
+        # Check if a new file is uploaded or if subs are empty
+        if st.session_state.uploaded_filename != uploader.name:
+            st.session_state.subs = [] # Clear existing if new file
             st.session_state.page = 0
-            st.rerun()
-        elif not st.session_state.subs:
+            st.session_state.uploaded_filename = uploader.name
             st.session_state.subs = parse_srt(autodetect_decode(uploader))
-
+            st.rerun() # Rerun to display data after upload
+        elif not st.session_state.subs: # If no subs but filename matches (rerun behavior)
+            st.session_state.subs = parse_srt(autodetect_decode(uploader))
+            st.rerun() # Rerun to display data after upload
+    
     if st.session_state.subs:
         st.divider()
         st.write(f"📊 Total Blocks: {len(st.session_state.subs)}")
         translated_count = sum(1 for s in st.session_state.subs if s["arabic"].strip())
         st.write(f"✅ Translated: {translated_count}")
         st.progress(translated_count / len(st.session_state.subs))
+
+        st.divider()
+        # --- Moved Download Section to Sidebar ---
+        st.subheader("⬇️ Download Translated SRT")
+        final_content = build_srt(st.session_state.subs)
+        st.download_button(
+            label="Download .srt File",
+            data=final_content,
+            file_name="translated_output.srt",
+            mime="text/plain"
+        )
+        st.info("File ready for download! Make sure all translations are complete.")
 
 # --- Main Logic ---
 st.title("🌍 Pro SRT AI Translator")
@@ -167,7 +201,8 @@ if col_action.button("🚀 Auto-Translate All (Batch Mode)"):
             
             while pending:
                 current_batch_idxs = pending[:BATCH_SIZE]
-                texts = ["\n".join(st.session_state.subs[i]["english_lines"]) for i in current_batch_idxs]
+                texts = ["
+".join(st.session_state.subs[i]["english_lines"]) for i in current_batch_idxs]
                 
                 try:
                     client = genai.Client(api_key=api_keys[key_idx])
@@ -209,7 +244,7 @@ if col_action.button("🚀 Auto-Translate All (Batch Mode)"):
                     
                     # 2. If all 4 models exhausted, move to next key
                     if model_idx >= len(MODELS):
-                        st.error(f"❌ Key #{key_idx+1} exhausted for all 4 models. Rotating Key...")
+                        st.error(f"❌ Key #{key_idx+1} exhausted for all {len(MODELS)} models. Rotating Key...")
                         model_idx = 0
                         key_idx = (key_idx + 1) % len(api_keys)
                         time.sleep(5)
@@ -238,22 +273,11 @@ for i in range(start_idx, end_idx):
         st.markdown(f"<div class='subtitle-block'><div class='block-idx'># {s['index']} ({s['start']} → {s['end']})</div>", unsafe_allow_html=True)
         c1, c2 = st.columns(2)
         with c1:
-            eng_text = "\n".join(s["english_lines"])
+            eng_text = "
+".join(s["english_lines"])
             new_eng = st.text_area("English Source", eng_text, key=f"eng_{i}", height=100)
             st.session_state.subs[i]["english_lines"] = new_eng.splitlines()
         with c2:
             new_arabic = st.text_area("Arabic Translation", s["arabic"], key=f"arabic_{i}", height=100)
             st.session_state.subs[i]["arabic"] = new_arabic
         st.markdown("</div>", unsafe_allow_html=True)
-
-# --- Final Export ---
-st.divider()
-if st.button("📦 Finalize & Download SRT"):
-    final_content = build_srt(st.session_state.subs)
-    st.download_button(
-        label="📥 Download Translated SRT",
-        data=final_content,
-        file_name="translated_output.srt",
-        mime="text/plain"
-    )
-    st.success("File generated!")
