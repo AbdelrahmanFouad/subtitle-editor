@@ -106,8 +106,7 @@ def translate_batch(client, model_id, block_texts):
     response = client.models.generate_content(
         model=model_id, 
         contents=prompt, 
-        config=config,
-        http_options={'timeout': 60000}
+        config=config
     )
     
     # Extract blocks using regex
