@@ -7,7 +7,14 @@ from google import genai
 from google.genai import types
 
 # --- Configure Gemini API ---
-DEFAULT_MODEL = "gemini-2.5-flash" 
+MODELS = [
+    "gemini-2.5-flash", 
+    "gemini-3.1-flash-lit", 
+    "gemini-3.1-flash",
+    "gemini-3.5-flash",
+    "gemini-3.1-flash-lite",
+    "gemini-3-flash-preview"
+]
 
 st.set_page_config(layout="wide")
 st.title("SRT Editor & Translator: English → Arabic (AI)")
@@ -97,16 +104,25 @@ if st.button("🚀 Translate Entire File (in batches)"):
     if pending_idxs:
         progress_bar = st.progress(0)
         status_text = st.empty()
-        key_idx, current_progress = 0, 0
+        
+        key_idx = 0
+        current_progress = 0
+        
+        # Track which model to use next for each API key
+        model_indices = {i: 0 for i in range(len(api_keys))}
         
         while current_progress < len(pending_idxs):
             client = genai.Client(api_key=api_keys[key_idx])
+            
+            # Select the current model for this specific key
+            current_model = MODELS[model_indices[key_idx]]
+            
             batch = pending_idxs[current_progress : current_progress + 12]
             texts = ["\n".join(st.session_state.subs[i]["english_lines"]) for i in batch]
             
             try:
-                status_text.info(f"Using Key #{key_idx+1} | Translating Blocks {st.session_state.subs[batch[0]]['index']} - {st.session_state.subs[batch[-1]]['index']}")
-                translations = translate_batch(client, DEFAULT_MODEL, texts)
+                status_text.info(f"Using Key #{key_idx+1} | Model: {current_model} | Translating Blocks {st.session_state.subs[batch[0]]['index']} - {st.session_state.subs[batch[-1]]['index']}")
+                translations = translate_batch(client, current_model, texts)
                 
                 for i, idx in enumerate(batch):
                     if i < len(translations):
@@ -117,18 +133,33 @@ if st.button("🚀 Translate Entire File (in batches)"):
                 
                 current_progress += len(batch)
                 progress_bar.progress(current_progress / len(pending_idxs))
+                
+                # Success: Rotate to the next model for this key to spread the rate limit
+                model_indices[key_idx] = (model_indices[key_idx] + 1) % len(MODELS)
                 time.sleep(10)
+                
             except Exception as e:
                 err_str = str(e).lower()
                 if any(x in err_str for x in ["quota", "429", "resource", "limit"]):
-                    st.warning(f"Key #{key_idx+1} limit hit. Rotating...")
-                    key_idx = (key_idx + 1) % len(api_keys)
+                    st.warning(f"Key #{key_idx+1} (Model: {current_model}) limit hit. Trying next model or rotating key...")
+                    
+                    # Try to rotate the model for the current key first
+                    model_indices[key_idx] = (model_indices[key_idx] + 1) % len(MODELS)
+                    
+                    # If we looped back to 0, it means all models for this key hit a limit, so we switch to the next API key
+                    if model_indices[key_idx] == 0:
+                        key_idx = (key_idx + 1) % len(api_keys)
+                    
                     time.sleep(2)
                 else:
-                    st.error(f"Error with Key #{key_idx+1}: {e}")
-                    # Rotate even on general errors to try another key
-                    key_idx = (key_idx + 1) % len(api_keys)
+                    st.error(f"Error with Key #{key_idx+1} (Model: {current_model}): {e}")
+                    
+                    # On other errors, rotate model first and jump to next key if we exhausted models
+                    model_indices[key_idx] = (model_indices[key_idx] + 1) % len(MODELS)
+                    if model_indices[key_idx] == 0:
+                        key_idx = (key_idx + 1) % len(api_keys)
                     time.sleep(5)
+                    
         st.success("Done!")
         time.sleep(1)
         st.rerun()
