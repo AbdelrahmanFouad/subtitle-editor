@@ -9,7 +9,7 @@ upload of finished files to Google Drive.
   batches) and the results table fills in as blocks complete.
 * Accurate: index-based response parsing, per-block retry, within-file reuse.
 * Robust: thread-safe key pool with parking; every retryable error handled.
-* Persistent: finished files are flushed to Drive as `subtitles/<reel>_translated.srt`.
+* Persistent: finished files are flushed to Drive as `subtitles/<original>_translated.srt`.
 
 Usage:
     streamlit run srte.py
@@ -425,7 +425,9 @@ if not st.session_state.subs:
     st.stop()
 
 subs = st.session_state.subs
-source_name = st.session_state.source_name or "reel.srt"
+source_name = st.session_state.source_name
+# output name always preserves the original upload name (never generic)
+out_filename = f"{Path(source_name).stem}_translated.srt" if source_name else "translated.srt"
 
 # ---------------------------------------------------------------- live merge
 
@@ -446,13 +448,11 @@ if _results:
 # once the run finishes, flush the finished file to Drive (once)
 if not _running and not _finalized and _total:
     _live["finalized"] = True
-    stem = Path(source_name).stem or "reel"
-    out_name = f"{stem}_translated.srt"
     final_srt = build_srt(subs)
     if drive:
         try:
-            drive.upload_translated(final_srt, out_name)
-            st.session_state["drive_saved"] = f"subtitles/{out_name}"
+            drive.upload_translated(final_srt, out_filename)
+            st.session_state["drive_saved"] = f"subtitles/{out_filename}"
         except Exception as e:  # noqa: BLE001
             st.session_state["drive_error"] = str(e)
     else:
@@ -605,7 +605,7 @@ with c6:
     st.download_button(
         "⬇️ Download .srt",
         build_srt(subs),
-        file_name=f"{Path(source_name).stem}_translated.srt",
+        file_name=out_filename,
         mime="text/plain",
         width="stretch",
     )
