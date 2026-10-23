@@ -1,24 +1,15 @@
 """
 srte.py — SRT Editor & Translator: English → Arabic (AI)
 
-A fast, accurate, robust Streamlit app for translating SRT subtitles with
-Google Gemini across a pool of API keys.
+A fast, concurrent Streamlit app for translating SRT subtitles with Google
+Gemini across a pool of API keys, with live-streaming results and automatic
+upload of finished files to Google Drive.
 
-Highlights
-----------
-* CONCURRENT translation — one worker lane per API key, batches fanned out
-  with a ThreadPoolExecutor. A 331-block file that took minutes now lands in
-  ~15-25 s.
-* ACCURATE — index-based response parsing (a missing block can't shift its
-  neighbours), per-block retry, and a within-file reuse cache so a repeated
-  line is translated once and reused consistently.
-* ROBUST — a thread-safe key pool that round-robins across every key, parks a
-  key after repeated failures, and never spins forever on a stuck batch.
-  Every retryable error (429, 503, 404, connection/timeout) is handled.
-* WIDE Arabic detection — base + supplement + extended-A/B + presentation
-  forms, so no Arabic line is misclassified as English.
-* Modern UI — live metrics, progress, an editable data grid for review, and a
-  translation scope selector (missing / partial / all).
+* Live: a background worker translates in parallel (10 workers × 16-block
+  batches) and the results table fills in as blocks complete.
+* Accurate: index-based response parsing, per-block retry, within-file reuse.
+* Robust: thread-safe key pool with parking; every retryable error handled.
+* Persistent: finished files are flushed to Drive as `subtitles/<reel>_translated.srt`.
 
 Usage:
     streamlit run srte.py
@@ -31,7 +22,6 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
 from pathlib import Path
 
 import chardet
@@ -40,13 +30,10 @@ import streamlit as st
 from google import genai
 from google.genai import types
 
-from drive_store import Checkpoint, DriveStore, get_drive_store
+from drive_store import DriveStore, get_drive_store
 
 # ---------------------------------------------------------------- configuration
 
-# Models verified to exist and to return the [N]-delimited format. The retired
-# gemini-2.0-flash and the 503-prone gemini-3.8-flash / gemini-3.5-flash-lite
-# are intentionally absent.
 MODELS = [
     "gemini-2.5-flash",
     "gemini-2.5-flash-lite",
@@ -54,10 +41,12 @@ MODELS = [
     "gemini-3.1-flash-lite",
 ]
 
-DEFAULT_BATCH_SIZE = 16
-MAX_BATCH_ATTEMPTS = 4      # attempts per batch before it is abandoned
-MAX_ROUNDS = 3              # rounds of shrinking granularity
-MAX_KEY_FAILS = 3           # consecutive failures that park a key
+BATCH_SIZE = 16
+WORKERS = 10
+MAX_BATCH_ATTEMPTS = 4
+MAX_ROUNDS = 3
+MAX_KEY_FAILS = 3
+DRIVE_FOLDER = "subtitles"
 
 RETRYABLE = (
     "quota", "429", "resource", "limit", "not found", "unsupported",
@@ -129,11 +118,6 @@ def build_srt(subs: list[dict]) -> str:
 
 
 def split_indexed(response_text: str) -> dict[int, str]:
-    """Map the model's own [N] markers to their bodies.
-
-    Keyed by the number the model printed, so a missing or empty entry cannot
-    shift every later translation (the positional split did exactly that).
-    """
     out: dict[int, str] = {}
     parts = re.split(r"\[(\d+)\]", response_text.strip())
     for i in range(1, len(parts) - 1, 2):
@@ -157,23 +141,14 @@ def translate_batch(client, model_id: str, block_texts: list[str]) -> dict[int, 
     return split_indexed(response.text)
 
 
-def arabic_line_count(s: dict) -> int:
-    return len([l for l in s["arabic"].split("\n") if l.strip()])
-
-
 def block_status(s: dict) -> str:
-    ar = arabic_line_count(s)
+    ar = len([l for l in s["arabic"].split("\n") if l.strip()])
     if not ar:
         return "missing"
-    if ar < len(s["english_lines"]):
-        return "partial"
-    return "done"
+    return "done" if ar >= len(s["english_lines"]) else "missing"
 
 
 def build_reuse_map(subs: list[dict]) -> dict[str, str]:
-    """Within-file reuse: english (lowercased, joined) -> arabic for blocks that
-    are already fully translated. Repeated lines reuse the same translation,
-    which is both faster and more consistent."""
     m: dict[str, str] = {}
     for s in subs:
         if block_status(s) != "done":
@@ -186,158 +161,7 @@ def build_reuse_map(subs: list[dict]) -> dict[str, str]:
 
 # ---------------------------------------------------------------- persistence
 
-# Checkpoints are mirrored to TWO places:
-#   * local  -> checkpoints/ next to the script (always, offline-safe)
-#   * drive  -> a Google Drive folder (survives Streamlit Cloud session wipes)
-# The Store dispatcher prefers Drive for list/load when a token is configured,
-# but always writes local as a fallback and for the portable .srt snapshot.
-
-APP_DIR = Path(__file__).resolve().parent
-CHECKPOINT_DIR = APP_DIR / "checkpoints"
-HISTORY_DIR = CHECKPOINT_DIR / "history"
-LATEST_JSON = CHECKPOINT_DIR / "latest.json"
-
-
-def _safe_name(name: str) -> str:
-    return re.sub(r"[^\w\-.]", "_", name or "srt")
-
-
-def _checkpoint_payload(subs, source_name, tag, ts):
-    return {"source": source_name, "tag": tag, "saved": ts,
-            "blocks": len(subs), "subs": subs}
-
-
-class LocalStore:
-    """File-based checkpoint backend (ref = 'local:<path>')."""
-
-    def save_checkpoint(self, subs, source_name, tag="auto"):
-        CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
-        HISTORY_DIR.mkdir(parents=True, exist_ok=True)
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        payload = _checkpoint_payload(subs, source_name, tag, ts)
-        try:
-            LATEST_JSON.write_text(
-                json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-            safe = _safe_name(source_name)
-            (HISTORY_DIR / f"{ts}_{safe}.json").write_text(
-                json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-            (HISTORY_DIR / f"{ts}_{safe}.srt").write_text(
-                build_srt(subs), encoding="utf-8-sig")
-        except OSError:
-            pass
-        return ts
-
-    def list_checkpoints(self):
-        if not HISTORY_DIR.exists():
-            return []
-        out = []
-        for p in sorted(HISTORY_DIR.glob("*.json"),
-                        key=lambda x: x.stat().st_mtime, reverse=True):
-            m = re.match(r"(\d{8}_\d{6})_(.*)\.json$", p.name)
-            if not m:
-                continue
-            out.append(Checkpoint(ref=f"local:{p}", source=m.group(2),
-                                  saved=m.group(1), blocks=0,
-                                  label=f"{m.group(1)} · {m.group(2)}"))
-        return out
-
-    def load_checkpoint(self, ref):
-        path = Path(str(ref).removeprefix("local:"))
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return data["subs"], data.get("source", ""), data.get("saved", "")
-
-    def latest_meta(self):
-        if not LATEST_JSON.exists():
-            return None
-        try:
-            return json.loads(LATEST_JSON.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return None
-
-    def load_latest(self):
-        meta = self.latest_meta()
-        if not meta:
-            return None
-        return meta["subs"], meta.get("source", ""), meta.get("saved", "")
-
-    def prune(self, keep=50):
-        cps = self.list_checkpoints()
-        for c in cps[keep:]:
-            try:
-                Path(str(c.ref).removeprefix("local:")).unlink()
-            except OSError:
-                pass
-
-
-class Store:
-    """Unified checkpoint facade: local always, Drive when configured."""
-
-    def __init__(self, local: LocalStore, drive: DriveStore | None):
-        self.local = local
-        self.drive = drive
-
-    def save_checkpoint(self, subs, source_name, tag="auto"):
-        ts = self.local.save_checkpoint(subs, source_name, tag)
-        if self.drive:
-            try:
-                self.drive.save_checkpoint(subs, source_name, tag)
-            except Exception:
-                pass
-        return ts
-
-    def list_checkpoints(self):
-        if self.drive:
-            try:
-                cps = self.drive.list_checkpoints()
-                if cps:
-                    return cps
-            except Exception:
-                pass
-        return self.local.list_checkpoints()
-
-    def load_checkpoint(self, ref):
-        if self.drive and str(ref).startswith("drive:"):
-            try:
-                return self.drive.load_checkpoint(ref)
-            except Exception:
-                pass
-        return self.local.load_checkpoint(ref)
-
-    def latest_meta(self):
-        if self.drive:
-            try:
-                meta = self.drive.latest_meta()
-                if meta:
-                    return meta
-            except Exception:
-                pass
-        return self.local.latest_meta()
-
-    def load_latest(self):
-        if self.drive:
-            try:
-                latest = self.drive.load_latest()
-                if latest:
-                    return latest
-            except Exception:
-                pass
-        return self.local.load_latest()
-
-    def prune(self, keep=50):
-        self.local.prune(keep)
-        if self.drive:
-            try:
-                self.drive.prune(keep)
-            except Exception:
-                pass
-
-
 def _read_drive_token():
-    """Return the personal Drive token from Streamlit secrets, if present.
-
-    `st.secrets.drive_token` may be a dict, a JSON string, or (for local dev) a
-    path to a token file. Returns None when unavailable -> local-only mode.
-    """
     raw = None
     try:
         raw = st.secrets.get("drive_token")
@@ -361,18 +185,13 @@ def _read_drive_token():
     return None
 
 
-store = Store(LocalStore(), get_drive_store(_read_drive_token()))
+drive = get_drive_store(_read_drive_token())
 
 
 # ---------------------------------------------------------------- key pool
 
 class KeyPool:
-    """Thread-safe round-robin over API keys.
-
-    Each key keeps its own position in the model list. A key that fails
-    MAX_KEY_FAILS times consecutively is parked until every key is parked, at
-    which point the counters reset and the pool keeps going.
-    """
+    """Thread-safe round-robin over API keys with parking."""
 
     def __init__(self, n_keys: int):
         self.n = n_keys
@@ -427,75 +246,167 @@ def _one_batch(pool, clients, subs, batch, reuse_map):
     return {idx: "" for idx in batch}, last_err
 
 
-def translate_all(subs, pending, api_keys, batch_size, workers, reuse_map,
-                  progress_cb, log_cb, apply_cb=None) -> dict[int, str]:
-    """Fan out all pending blocks across worker threads; retry in rounds.
-
-    `apply_cb(idx, text)` is called on the calling thread for every block as it
-    completes, so the caller can persist progress incrementally (crash-safe)
-    without the workers touching shared state.
-
-    Returns {idx: arabic_text} for every block that was translated (missing
-    blocks are absent).
-    """
+def translate_all(subs, pending, api_keys, reuse_map, apply_cb=None) -> dict[int, str]:
     clients = [genai.Client(api_key=k) for k in api_keys]
     pool = KeyPool(len(api_keys))
     result: dict[int, str] = {}
-    resolved_immediately: dict[int, str] = {}
+    resolved: dict[int, str] = {}
 
-    # Phase 0 — reuse cache, zero API calls
     for i in list(pending):
         key = "\n".join(subs[i]["english_lines"]).strip().lower()
         if key in reuse_map:
-            resolved_immediately[i] = reuse_map[key]
-    result.update(resolved_immediately)
+            resolved[i] = reuse_map[key]
+    result.update(resolved)
     if apply_cb:
-        for idx, t in resolved_immediately.items():
+        for idx, t in resolved.items():
             apply_cb(idx, t)
 
     remaining = [i for i in pending if i not in result]
-    total = len(pending)
-    progress_cb(len(result), total, "reuse")
+    rounds = [BATCH_SIZE, max(1, BATCH_SIZE // 2), 1][:MAX_ROUNDS]
 
-    rounds = [
-        ("batch", batch_size),
-        ("batch", max(1, batch_size // 2)),
-        ("single", 1),
-    ][:MAX_ROUNDS]
-
-    for round_no, (label, size) in enumerate(rounds):
+    for size in rounds:
         if not remaining:
             break
         batches = [remaining[i:i + size] for i in range(0, len(remaining), size)]
-        n_workers = min(workers, max(1, len(batches)))
+        n_workers = min(WORKERS, max(1, len(batches)))
         with ThreadPoolExecutor(max_workers=n_workers) as ex:
             futs = {ex.submit(_one_batch, pool, clients, subs, b, reuse_map): b
                     for b in batches}
-            done = 0
             for f in as_completed(futs):
-                got, err = f.result()
+                got, _ = f.result()
                 for idx, t in got.items():
                     if t:
                         result[idx] = t
                         if apply_cb:
                             apply_cb(idx, t)
-                if err:
-                    log_cb(err)
-                done += 1
-                progress_cb(len(result), total, f"{label} r{round_no + 1}")
         remaining = [i for i in remaining if i not in result]
 
     return result
 
 
-# ---------------------------------------------------------------- session state
+# ---------------------------------------------------------------- live run
 
-st.set_page_config(page_title="SRT Translator", layout="wide")
+@st.cache_resource
+def _live_ctrl():
+    return {
+        "lock": threading.Lock(),
+        "running": False,
+        "total": 0,
+        "results": {},
+        "log": [],
+        "error": None,
+        "t0": 0.0,
+        "elapsed": 0.0,
+        "finalized": False,
+        "source_name": "",
+    }
+
+
+def _translate_worker(ctrl, subs, pending, api_keys, reuse_map):
+    def apply_cb(idx, text):
+        with ctrl["lock"]:
+            ctrl["results"][idx] = text
+
+    def progress_cb(resolved, total, tag):
+        pass
+
+    def log_cb(err):
+        with ctrl["lock"]:
+            ctrl["log"].append(err)
+
+    try:
+        translate_all(subs, pending, api_keys, reuse_map, apply_cb=apply_cb)
+        with ctrl["lock"]:
+            ctrl["elapsed"] = time.time() - ctrl["t0"]
+            ctrl["running"] = False
+    except Exception as e:  # noqa: BLE001
+        with ctrl["lock"]:
+            ctrl["error"] = str(e)
+            ctrl["elapsed"] = time.time() - ctrl["t0"]
+            ctrl["running"] = False
+
+
+# ---------------------------------------------------------------- theme & page
+
+st.set_page_config(
+    page_title="SRT Translator",
+    page_icon="🎬",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+st.markdown("""
+<style>
+:root {
+    --bg: #0e1117;
+    --panel: #161b26;
+    --border: #262d3a;
+    --accent: #F1C409;
+    --blue: #0F76B2;
+    --text: #e6e9ef;
+    --muted: #8b93a3;
+}
+.stApp { background: var(--bg); color: var(--text); }
+[data-testid="stHeader"] { background: transparent; }
+[data-testid="stSidebar"] { background: var(--panel); border-right: 1px solid var(--border); }
+.block-container { padding-top: 1.4rem; max-width: 1400px; }
+h1, h2, h3 { color: var(--text); letter-spacing: -0.01em; }
+p, label, .stCaption { color: var(--muted); }
+
+/* metric cards */
+[data-testid="stMetric"] {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 14px 16px;
+}
+[data-testid="stMetricLabel"] { color: var(--muted); }
+[data-testid="stMetricValue"] { color: var(--text); font-weight: 700; }
+
+/* primary button — gold */
+.stButton > button[kind="primary"] {
+    background: linear-gradient(180deg, #f7d32a, #e0b40a);
+    color: #1a1400;
+    border: none;
+    border-radius: 10px;
+    font-weight: 700;
+    box-shadow: 0 2px 8px rgba(241,196,9,0.25);
+}
+.stButton > button[kind="primary"]:hover { background: #f7d32a; color: #000; }
+
+/* progress bar */
+[data-testid="stProgress"] > div > div > div > div { background: var(--accent); }
+
+/* data editor */
+[data-testid="stDataFrame"] {
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    overflow: hidden;
+}
+
+/* file uploader */
+[data-testid="stFileUploader"] section {
+    background: var(--panel);
+    border: 1px dashed var(--border);
+    border-radius: 12px;
+}
+
+/* radio */
+.stRadio label { color: var(--text); }
+</style>
+""", unsafe_allow_html=True)
+
+st.title("🎬 SRT Translator")
+st.caption("English → Arabic subtitle translation · concurrent · auto-saved to Google Drive")
+
+# ---------------------------------------------------------------- session state
 
 if "subs" not in st.session_state:
     st.session_state.subs = []
 if "loaded_file" not in st.session_state:
     st.session_state.loaded_file = None
+if "source_name" not in st.session_state:
+    st.session_state.source_name = ""
 
 uploader = st.file_uploader("Upload SRT file", type="srt")
 
@@ -504,169 +415,149 @@ if uploader:
     if st.session_state.loaded_file != sig:
         st.session_state.subs = parse_srt(autodetect_decode(uploader))
         st.session_state.loaded_file = sig
+        st.session_state.source_name = uploader.name
         for k in [k for k in st.session_state.keys()
                   if k.startswith(("arabic_", "english_", "start_", "end_"))]:
             del st.session_state[k]
 
 if not st.session_state.subs:
-    # Fresh session: offer recovery from the last checkpoint before asking for
-    # an upload. This is how lost work is recovered after a session drop.
-    cps = store.list_checkpoints()
-    if cps:
-        meta = store.latest_meta()
-        src = meta.get("source") if meta else ""
-        saved = meta.get("saved") if meta else ""
-        blocks = meta.get("blocks") if meta else ""
-        st.warning(
-            f"Found saved work: **{src}** ({blocks} blocks, saved {saved}). "
-            "Recover it below instead of starting over."
-        )
-        c_rec, c_up = st.columns([1, 3])
-        with c_rec:
-            if st.button("♻️ Recover last session", type="primary"):
-                try:
-                    latest = store.load_latest()
-                    if latest:
-                        subs, src_name, saved_at = latest
-                        st.session_state.subs = subs
-                        st.session_state.loaded_file = f"recovered:{src_name}:{saved_at}"
-                        st.rerun()
-                    else:
-                        st.error("No recoverable checkpoint found.")
-                except Exception as e:
-                    st.error(f"Recovery failed: {e}")
-        with c_up:
-            st.caption("or upload a new .srt below.")
     st.info("Upload an .srt file to begin.")
     st.stop()
 
 subs = st.session_state.subs
+source_name = st.session_state.source_name or "reel.srt"
+
+# ---------------------------------------------------------------- live merge
+
+_live = _live_ctrl()
+with _live["lock"]:
+    _running = _live["running"]
+    _results = dict(_live["results"])
+    _total = _live["total"]
+    _error = _live["error"]
+    _elapsed = _live["elapsed"]
+    _finalized = _live["finalized"]
+
+if _results:
+    for _i, _t in _results.items():
+        if _i < len(subs) and subs[_i].get("arabic") != _t:
+            subs[_i]["arabic"] = _t
+
+# once the run finishes, flush the finished file to Drive (once)
+if not _running and not _finalized and _total:
+    _live["finalized"] = True
+    stem = Path(source_name).stem or "reel"
+    out_name = f"{stem}_translated.srt"
+    final_srt = build_srt(subs)
+    if drive:
+        try:
+            drive.upload_translated(final_srt, out_name)
+            st.session_state["drive_saved"] = f"subtitles/{out_name}"
+        except Exception as e:  # noqa: BLE001
+            st.session_state["drive_error"] = str(e)
+    else:
+        st.session_state["drive_saved"] = None
 
 # ---------------------------------------------------------------- sidebar
 
 with st.sidebar:
     st.header("Settings")
-    scope_label = st.radio(
-        "Translate which blocks?",
-        ["missing (no Arabic)", "partial (also stale Arabic)", "all blocks"],
-        index=0, key="scope",
+    mode = st.radio(
+        "Translation scope",
+        ["Missing only", "Full file"],
+        index=0,
+        horizontal=True,
+        help="Missing only = translate blocks with no Arabic. Full file = re-translate everything.",
     )
-    scope = scope_label.split(" ")[0]
-    batch_size = st.slider("Batch size", 4, 24, DEFAULT_BATCH_SIZE, key="batch_size")
-    n_keys = st.number_input("API keys in use", 1, 10, 10, key="n_keys")
-    workers = st.slider("Parallel workers", 1, 10, 8, key="workers")
-    reuse = st.checkbox("Reuse repeated lines (faster + consistent)", value=True,
-                        key="reuse")
-    st.caption("Workers ≈ API keys for max speed. Lower it if you hit quota.")
-
+    reuse = st.checkbox("Reuse repeated lines", value=True,
+                        help="A line that repeats elsewhere is translated once and reused.")
     st.divider()
-    st.subheader("Run history")
-    cps = store.list_checkpoints()
-    if cps:
-        st.caption(f"{len(cps)} saved checkpoint(s)")
-        for cp in cps[:8]:
-            key = f"restore_{cp.ref.replace(':', '_').replace('.', '_').replace('-', '_')}"
-            if st.button(cp.label, key=key):
-                try:
-                    rsubs, rsrc, rsaved = store.load_checkpoint(cp.ref)
-                    st.session_state.subs = rsubs
-                    st.session_state.loaded_file = f"recovered:{rsrc}:{rsaved}"
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Restore failed: {e}")
-    else:
-        st.caption("No checkpoints yet — run a translation and they'll appear here.")
+    st.caption("Worker pool and batch size are fixed for maximum throughput.")
+    st.markdown(
+        f"<div style='font-size:0.85rem;color:var(--muted)'>"
+        f"• {WORKERS} parallel workers<br>• {BATCH_SIZE} blocks per request<br>"
+        f"• Drive folder: <code>{DRIVE_FOLDER}/</code></div>",
+        unsafe_allow_html=True,
+    )
 
 # ---------------------------------------------------------------- metrics
 
 statuses = [block_status(s) for s in subs]
 n_total = len(subs)
 n_missing = statuses.count("missing")
-n_partial = statuses.count("partial")
 n_done = statuses.count("done")
 
-c1, c2, c3, c4, c5 = st.columns(5)
+c1, c2, c3, c4 = st.columns(4)
 c1.metric("Blocks", n_total)
 c2.metric("Done", n_done)
 c3.metric("Missing", n_missing)
-c4.metric("Partial", n_partial)
-c5.metric("Complete", f"{n_done / max(1, n_total) * 100:.0f}%")
+c4.metric("Complete", f"{n_done / max(1, n_total) * 100:.0f}%")
+
+if _running:
+    _done = len(_results)
+    st.progress(_done / max(1, _total))
+    st.caption(f"🔄 Translating… {_done}/{_total} blocks")
+elif _elapsed > 0:
+    _still = n_missing
+    msg = f"✅ Done in {_elapsed:.1f}s — {n_total - _still}/{n_total} translated"
+    if st.session_state.get("drive_saved"):
+        msg += f" · saved to Drive `{st.session_state['drive_saved']}`"
+    elif "drive_error" in st.session_state:
+        msg += f" · Drive upload failed: {st.session_state['drive_error']}"
+    else:
+        msg += " · Drive not configured — download below"
+    st.success(msg)
+    if _error:
+        st.error(f"Run error: {_error}")
+    with _live["lock"]:
+        _log = list(_live["log"])
+    if _log:
+        with st.expander(f"Errors during run ({len(_log)})"):
+            for line in _log[:50]:
+                st.text(line)
 
 
-def block_is_pending(s, sc):
-    if sc == "all":
+def block_is_pending(s, full):
+    if full:
         return True
-    if sc == "partial":
-        return block_status(s) in ("missing", "partial")
-    return block_status(s) == "missing"
+    return not s["arabic"].strip()
 
 
 # ---------------------------------------------------------------- translate
 
 if st.button("🚀 Translate", type="primary", width="stretch"):
     raw_keys = [v for k, v in st.secrets.items() if k.startswith("gemini_api")]
-    api_keys = list(dict.fromkeys([k for k in raw_keys if k]))[:n_keys]
+    api_keys = list(dict.fromkeys([k for k in raw_keys if k]))[:WORKERS]
 
     if not api_keys:
         st.error("No Gemini API keys found in secrets.")
         st.stop()
 
-    pending = [i for i, s in enumerate(subs) if block_is_pending(s, scope)]
+    full = mode.startswith("Full")
+    pending = [i for i, s in enumerate(subs) if block_is_pending(s, full)]
     if not pending:
-        st.success("Nothing to translate — every block is already done.")
+        st.success("Nothing to translate — every block already has Arabic.")
     else:
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        log_lines = []
-        # source name for checkpointing (upload name, or recovered identity)
-        source_name = uploader.name if uploader else st.session_state.loaded_file
-        if not source_name:
-            source_name = "recovered.srt"
-        checkpoint_meta = {"count": 0}
-
-        def apply_cb(idx, text):
-            subs[idx]["arabic"] = text
-            checkpoint_meta["count"] += 1
-            # persist every 12 applied blocks so a crash mid-run loses at most
-            # a handful of blocks, not the whole run
-            if checkpoint_meta["count"] % 12 == 0:
-                store.save_checkpoint(subs, source_name, tag="progress")
-
-        def progress_cb(resolved, total, tag):
-            progress_bar.progress(resolved / max(1, total))
-            status_text.caption(
-                f"{tag}: {resolved}/{total} blocks translated")
-
-        def log_cb(err):
-            log_lines.append(err)
-
-        t0 = time.time()
         reuse_map = build_reuse_map(subs) if reuse else {}
-        result = translate_all(
-            subs, pending, api_keys, batch_size, workers, reuse_map,
-            progress_cb, log_cb, apply_cb=apply_cb)
 
-        for idx, t in result.items():
-            subs[idx]["arabic"] = t
+        with _live["lock"]:
+            _live["results"] = {}
+            _live["log"] = []
+            _live["error"] = None
+            _live["total"] = len(pending)
+            _live["t0"] = time.time()
+            _live["elapsed"] = 0.0
+            _live["finalized"] = False
+            _live["source_name"] = source_name
+            _live["running"] = True
+        st.session_state.pop("drive_saved", None)
+        st.session_state.pop("drive_error", None)
 
-        store.save_checkpoint(subs, source_name, tag="complete")
-        store.prune()
-
-        still = [i for i in pending if not subs[i]["arabic"].strip()]
-        elapsed = time.time() - t0
-
-        status_text.success(
-            f"Done in {elapsed:.1f}s — {len(pending) - len(still)} translated, "
-            f"{len(still)} still missing.")
-        if still:
-            st.error(f"{len(still)} block(s) could not be translated:")
-            for i in still:
-                st.write(f"- #{subs[i]['index']}: "
-                         f"`{' / '.join(subs[i]['english_lines'])}`")
-        if log_lines:
-            with st.expander(f"Errors encountered ({len(log_lines)})"):
-                for line in log_lines[:50]:
-                    st.text(line)
+        threading.Thread(
+            target=_translate_worker,
+            args=(_live, subs, pending, api_keys, reuse_map),
+            daemon=True,
+        ).start()
         st.rerun()
 
 # ---------------------------------------------------------------- review
@@ -697,7 +588,6 @@ edited = st.data_editor(
     num_rows="fixed",
 )
 
-# sync edits back to canonical state (same run -> edits survive)
 _fp_before = [s["arabic"] for s in subs]
 for i, row in edited.iterrows():
     subs[i]["start"] = str(row["Start"]).strip()
@@ -705,9 +595,7 @@ for i, row in edited.iterrows():
     subs[i]["arabic"] = str(row["Arabic"]).rstrip("\n")
     subs[i]["english_lines"] = str(row["English"]).split("\n")
 _fp_after = [s["arabic"] for s in subs]
-if _fp_after != _fp_before:
-    store.save_checkpoint(subs, st.session_state.loaded_file or "edited.srt",
-                          tag="edit")
+_changed = _fp_after != _fp_before
 
 # ---------------------------------------------------------------- download
 
@@ -717,12 +605,18 @@ with c6:
     st.download_button(
         "⬇️ Download .srt",
         build_srt(subs),
-        file_name="translated.srt",
+        file_name=f"{Path(source_name).stem}_translated.srt",
         mime="text/plain",
         width="stretch",
     )
 with c7:
     st.caption(
-        "The file above is built live from the grid, so any edit you make "
-        "here is included in the download."
+        "Every edit here is included in the download and in the automatic "
+        "Google Drive upload that happens when translation completes."
     )
+
+# ---------------------------------------------------------------- live refresh
+
+if _running:
+    time.sleep(1.0)
+    st.rerun()

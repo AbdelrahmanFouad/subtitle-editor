@@ -1,16 +1,15 @@
 """
-drive_store.py — Google Drive persistence for the SRT translator.
+drive_store.py — Google Drive upload for the SRT translator.
 
-Account-agnostic: it reads a personal Google OAuth token (refresh_token +
-client_id + client_secret) and mirrors checkpoints to a Drive folder, so
-Streamlit Cloud sessions (which wipe their local filesystem) can still recover
-work.
+Uploads finished translations to a `subtitles/` folder on Google Drive as
+`<reel_name>_translated.srt`, so the output survives Streamlit Cloud session
+wipes.
 
-No google-auth dependency — it calls the Drive REST API directly with
-`requests`, refreshing the access token itself. This sidesteps the known
-`~/.venv` gotcha where google-auth is absent.
+Account-agnostic: reads a personal Google OAuth token (refresh_token +
+client_id + client_secret) and calls the Drive REST API directly with
+`requests`, refreshing its own access token. No google-auth dependency.
 
-Token shapes accepted (whichever key names the flow produced):
+Token shapes accepted:
     refresh_token, token_uri, client_id, client_secret   (google-auth format)
     refresh_token, client_id, client_secret, access_token (raw OAuth response)
 """
@@ -20,7 +19,6 @@ from __future__ import annotations
 import json
 import re
 import time
-from dataclasses import dataclass
 
 import requests
 
@@ -28,17 +26,7 @@ DRIVE_API = "https://www.googleapis.com/drive/v3"
 UPLOAD_API = "https://www.googleapis.com/upload/drive/v3"
 TOKEN_URI = "https://oauth2.googleapis.com/token"
 FOLDER_MIME = "application/vnd.google-apps.folder"
-JSON_MIME = "application/json"
 SRT_MIME = "text/plain"
-
-
-@dataclass
-class Checkpoint:
-    ref: str          # "drive:<id>" or "local:<path>" — opaque to the UI
-    source: str
-    saved: str
-    blocks: int
-    label: str
 
 
 def _safe_name(name: str) -> str:
@@ -46,9 +34,9 @@ def _safe_name(name: str) -> str:
 
 
 class DriveStore:
-    """Mirror checkpoints to a single Drive folder."""
+    """Upload finished SRTs to a single Drive folder."""
 
-    def __init__(self, token_data: dict, folder_name: str = "srt-translator-checkpoints"):
+    def __init__(self, token_data: dict, folder_name: str = "subtitles"):
         self.td = token_data or {}
         self.folder_name = folder_name
         self._folder_id = None
@@ -128,8 +116,8 @@ class DriveStore:
 
     # ------------------------------------------------------------- primitives
 
-    def upload(self, name: str, content: str, mime: str = JSON_MIME) -> str:
-        """Create (or replace) a file by name inside the checkpoint folder."""
+    def upload(self, name: str, content: str, mime: str = SRT_MIME) -> str:
+        """Create (or replace) a file by name inside the folder."""
         self._ensure_folder()
         existing = self._find_file(name)
         if existing:
@@ -150,94 +138,9 @@ class DriveStore:
         r.raise_for_status()
         return r.json()["id"]
 
-    def list_files(self) -> list[dict]:
-        fid = self._ensure_folder()
-        r = self._request(
-            "GET", f"{DRIVE_API}/files",
-            params={"q": f"'{fid}' in parents and trashed=false",
-                    "fields": "files(id,name,modifiedTime)",
-                    "orderBy": "modifiedTime desc", "pageSize": 200})
-        r.raise_for_status()
-        return r.json().get("files", [])
-
-    def download(self, file_id: str) -> str:
-        r = self._request("GET", f"{DRIVE_API}/files/{file_id}",
-                          params={"alt": "media"})
-        r.raise_for_status()
-        return r.text
-
-    def delete(self, file_id: str) -> None:
-        self._request("DELETE", f"{DRIVE_API}/files/{file_id}")
-
-    # ------------------------------------------------------------- checkpoints
-
-    def save_checkpoint(self, subs, source_name: str, tag: str = "auto") -> str:
-        ts = time.strftime("%Y%m%d_%H%M%S")
-        payload = {"source": source_name, "tag": tag, "saved": ts,
-                   "blocks": len(subs), "subs": subs}
-        content = json.dumps(payload, ensure_ascii=False)
-        safe = _safe_name(source_name)
-        # latest.json (overwritten) + one history .json + one portable .srt
-        self.upload("latest.json", content, JSON_MIME)
-        self.upload(f"{ts}_{safe}.json", content, JSON_MIME)
-        srt = self._build_srt(subs)
-        self.upload(f"{ts}_{safe}.srt", srt, SRT_MIME)
-        self.prune(keep=50)
-        return ts
-
-    @staticmethod
-    def _build_srt(subs) -> str:
-        chunks = []
-        for s in subs:
-            body = (f"{s['arabic']}\n" if s.get("arabic") else "") + "\n".join(
-                s.get("english_lines", []))
-            chunks.append(f"{s['index']}\n{s['start']} --> {s['end']}\n{body}")
-        return "\n\n".join(chunks)
-
-    def latest_meta(self) -> dict | None:
-        try:
-            fid = self._find_file("latest.json")
-            if not fid:
-                return None
-            return json.loads(self.download(fid))
-        except Exception:
-            return None
-
-    def list_checkpoints(self) -> list[Checkpoint]:
-        out = []
-        for f in self.list_files():
-            name = f["name"]
-            if name == "latest.json" or not name.endswith(".json"):
-                continue
-            m = re.match(r"(\d{8}_\d{6})_(.*)\.json$", name)
-            if not m:
-                continue
-            ts, src = m.group(1), m.group(2)
-            out.append(Checkpoint(
-                ref=f"drive:{f['id']}", source=src, saved=ts, blocks=0,
-                label=f"{ts} · {src}"))
-        return out
-
-    def load_checkpoint(self, ref: str):
-        file_id = ref.removeprefix("drive:")
-        data = json.loads(self.download(file_id))
-        return data["subs"], data.get("source", ""), data.get("saved", "")
-
-    def load_latest(self):
-        data = self.latest_meta()
-        if not data:
-            return None
-        return data["subs"], data.get("source", ""), data.get("saved", "")
-
-    def prune(self, keep: int = 50) -> None:
-        """Drop oldest history .json/.srt beyond `keep` (never latest.json)."""
-        files = self.list_files()
-        hist = [f for f in files if re.match(r"\d{8}_\d{6}_", f["name"])]
-        for f in hist[keep:]:
-            try:
-                self.delete(f["id"])
-            except Exception:
-                pass
+    def upload_translated(self, srt_content: str, out_name: str) -> str:
+        """Upload the finished SRT as `<reel>_translated.srt`."""
+        return self.upload(out_name, srt_content, SRT_MIME)
 
 
 def get_drive_store(token_data) -> DriveStore | None:
