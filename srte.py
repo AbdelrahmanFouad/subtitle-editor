@@ -26,10 +26,13 @@ Usage:
 
 from __future__ import annotations
 
+import json
 import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+from pathlib import Path
 
 import chardet
 import pandas as pd
@@ -179,6 +182,75 @@ def build_reuse_map(subs: list[dict]) -> dict[str, str]:
     return m
 
 
+# ---------------------------------------------------------------- persistence
+
+# Run history lives next to the script. Every completed batch and every edit is
+# checkpointed so a lost Streamlit session can be recovered from the last good
+# state instead of losing the whole run.
+APP_DIR = Path(__file__).resolve().parent
+CHECKPOINT_DIR = APP_DIR / "checkpoints"
+HISTORY_DIR = CHECKPOINT_DIR / "history"
+LATEST_JSON = CHECKPOINT_DIR / "latest.json"
+
+
+def _safe_name(name: str) -> str:
+    return re.sub(r"[^\w\-.]", "_", name or "srt")
+
+
+def save_checkpoint(subs, source_name: str, tag: str = "auto") -> str:
+    """Persist the full state to latest.json and a timestamped history entry.
+
+    Returns the timestamp string. Called from the translate loop (crash-safe,
+    one write per completed batch) and after edits.
+    """
+    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+    HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    payload = {
+        "source": source_name,
+        "tag": tag,
+        "saved": ts,
+        "blocks": len(subs),
+        "subs": subs,
+    }
+    try:
+        LATEST_JSON.write_text(
+            json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        safe = _safe_name(source_name)
+        (HISTORY_DIR / f"{ts}_{safe}.json").write_text(
+            json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        (HISTORY_DIR / f"{ts}_{safe}.srt").write_text(
+            build_srt(subs), encoding="utf-8-sig")
+    except OSError:
+        # persistence must never break the run — swallow filesystem errors
+        pass
+    return ts
+
+
+def list_checkpoints() -> list[Path]:
+    """Newest-first list of saved JSON checkpoints."""
+    if not HISTORY_DIR.exists():
+        return []
+    return sorted(HISTORY_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime,
+                  reverse=True)
+
+
+def load_checkpoint(path: Path) -> tuple[list[dict], str, str]:
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    return data["subs"], data.get("source", ""), data.get("saved", "")
+
+
+def prune_checkpoints(keep: int = 50) -> None:
+    """Drop the oldest history entries beyond `keep` to avoid unbounded growth."""
+    cps = list_checkpoints()
+    for p in cps[keep:]:
+        try:
+            p.unlink()
+            p.with_suffix(".srt").unlink()
+        except OSError:
+            pass
+
+
 # ---------------------------------------------------------------- key pool
 
 class KeyPool:
@@ -243,8 +315,12 @@ def _one_batch(pool, clients, subs, batch, reuse_map):
 
 
 def translate_all(subs, pending, api_keys, batch_size, workers, reuse_map,
-                  progress_cb, log_cb) -> dict[int, str]:
+                  progress_cb, log_cb, apply_cb=None) -> dict[int, str]:
     """Fan out all pending blocks across worker threads; retry in rounds.
+
+    `apply_cb(idx, text)` is called on the calling thread for every block as it
+    completes, so the caller can persist progress incrementally (crash-safe)
+    without the workers touching shared state.
 
     Returns {idx: arabic_text} for every block that was translated (missing
     blocks are absent).
@@ -260,6 +336,9 @@ def translate_all(subs, pending, api_keys, batch_size, workers, reuse_map,
         if key in reuse_map:
             resolved_immediately[i] = reuse_map[key]
     result.update(resolved_immediately)
+    if apply_cb:
+        for idx, t in resolved_immediately.items():
+            apply_cb(idx, t)
 
     remaining = [i for i in pending if i not in result]
     total = len(pending)
@@ -285,6 +364,8 @@ def translate_all(subs, pending, api_keys, batch_size, workers, reuse_map,
                 for idx, t in got.items():
                     if t:
                         result[idx] = t
+                        if apply_cb:
+                            apply_cb(idx, t)
                 if err:
                     log_cb(err)
                 done += 1
@@ -315,6 +396,35 @@ if uploader:
             del st.session_state[k]
 
 if not st.session_state.subs:
+    # Fresh session: offer recovery from the last checkpoint before asking for
+    # an upload. This is how lost work is recovered after a session drop.
+    cps = list_checkpoints()
+    if cps:
+        latest_meta = None
+        if LATEST_JSON.exists():
+            try:
+                latest_meta = json.loads(LATEST_JSON.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                latest_meta = None
+        src = latest_meta.get("source") if latest_meta else ""
+        saved = latest_meta.get("saved") if latest_meta else ""
+        blocks = latest_meta.get("blocks") if latest_meta else ""
+        st.warning(
+            f"Found saved work: **{src}** ({blocks} blocks, saved {saved}). "
+            "Recover it below instead of starting over."
+        )
+        c_rec, c_up = st.columns([1, 3])
+        with c_rec:
+            if st.button("♻️ Recover last session", type="primary"):
+                try:
+                    subs, src_name, saved_at = load_checkpoint(LATEST_JSON)
+                    st.session_state.subs = subs
+                    st.session_state.loaded_file = f"recovered:{src_name}:{saved_at}"
+                    st.rerun()
+                except (OSError, json.JSONDecodeError, KeyError) as e:
+                    st.error(f"Recovery failed: {e}")
+        with c_up:
+            st.caption("or upload a new .srt below.")
     st.info("Upload an .srt file to begin.")
     st.stop()
 
@@ -336,6 +446,28 @@ with st.sidebar:
     reuse = st.checkbox("Reuse repeated lines (faster + consistent)", value=True,
                         key="reuse")
     st.caption("Workers ≈ API keys for max speed. Lower it if you hit quota.")
+
+    st.divider()
+    st.subheader("Run history")
+    cps = list_checkpoints()
+    if cps:
+        st.caption(f"{len(cps)} saved checkpoint(s)")
+        for p in cps[:8]:
+            try:
+                meta = json.loads(p.read_text(encoding="utf-8"))
+                label = f"{meta.get('saved', '')} · {meta.get('source', '')} · {meta.get('blocks', '')} blk"
+            except (OSError, json.JSONDecodeError):
+                label = p.name
+            if st.button(label, key=f"restore_{p.stem}"):
+                try:
+                    rsubs, rsrc, rsaved = load_checkpoint(p)
+                    st.session_state.subs = rsubs
+                    st.session_state.loaded_file = f"recovered:{rsrc}:{rsaved}"
+                    st.rerun()
+                except (OSError, json.JSONDecodeError, KeyError) as e:
+                    st.error(f"Restore failed: {e}")
+    else:
+        st.caption("No checkpoints yet — run a translation and they'll appear here.")
 
 # ---------------------------------------------------------------- metrics
 
@@ -378,7 +510,19 @@ if st.button("🚀 Translate", type="primary", width="stretch"):
         progress_bar = st.progress(0)
         status_text = st.empty()
         log_lines = []
-        key_usage: dict[int, int] = {}
+        # source name for checkpointing (upload name, or recovered identity)
+        source_name = uploader.name if uploader else st.session_state.loaded_file
+        if not source_name:
+            source_name = "recovered.srt"
+        checkpoint_meta = {"count": 0}
+
+        def apply_cb(idx, text):
+            subs[idx]["arabic"] = text
+            checkpoint_meta["count"] += 1
+            # persist every 12 applied blocks so a crash mid-run loses at most
+            # a handful of blocks, not the whole run
+            if checkpoint_meta["count"] % 12 == 0:
+                save_checkpoint(subs, source_name, tag="progress")
 
         def progress_cb(resolved, total, tag):
             progress_bar.progress(resolved / max(1, total))
@@ -392,10 +536,13 @@ if st.button("🚀 Translate", type="primary", width="stretch"):
         reuse_map = build_reuse_map(subs) if reuse else {}
         result = translate_all(
             subs, pending, api_keys, batch_size, workers, reuse_map,
-            progress_cb, log_cb)
+            progress_cb, log_cb, apply_cb=apply_cb)
 
         for idx, t in result.items():
             subs[idx]["arabic"] = t
+
+        save_checkpoint(subs, source_name, tag="complete")
+        prune_checkpoints()
 
         still = [i for i in pending if not subs[i]["arabic"].strip()]
         elapsed = time.time() - t0
@@ -443,11 +590,16 @@ edited = st.data_editor(
 )
 
 # sync edits back to canonical state (same run -> edits survive)
+_fp_before = [s["arabic"] for s in subs]
 for i, row in edited.iterrows():
     subs[i]["start"] = str(row["Start"]).strip()
     subs[i]["end"] = str(row["End"]).strip()
     subs[i]["arabic"] = str(row["Arabic"]).rstrip("\n")
     subs[i]["english_lines"] = str(row["English"]).split("\n")
+_fp_after = [s["arabic"] for s in subs]
+if _fp_after != _fp_before:
+    save_checkpoint(subs, st.session_state.loaded_file or "edited.srt",
+                    tag="edit")
 
 # ---------------------------------------------------------------- download
 

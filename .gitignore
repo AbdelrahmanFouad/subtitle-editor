@@ -5,6 +5,7 @@
 fixed_translations/
 new_srt/
 translated_srt/
+checkpoints/
 *.zip
 config.toml
 
