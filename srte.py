@@ -40,6 +40,8 @@ import streamlit as st
 from google import genai
 from google.genai import types
 
+from drive_store import Checkpoint, DriveStore, get_drive_store
+
 # ---------------------------------------------------------------- configuration
 
 # Models verified to exist and to return the [N]-delimited format. The retired
@@ -184,9 +186,12 @@ def build_reuse_map(subs: list[dict]) -> dict[str, str]:
 
 # ---------------------------------------------------------------- persistence
 
-# Run history lives next to the script. Every completed batch and every edit is
-# checkpointed so a lost Streamlit session can be recovered from the last good
-# state instead of losing the whole run.
+# Checkpoints are mirrored to TWO places:
+#   * local  -> checkpoints/ next to the script (always, offline-safe)
+#   * drive  -> a Google Drive folder (survives Streamlit Cloud session wipes)
+# The Store dispatcher prefers Drive for list/load when a token is configured,
+# but always writes local as a fallback and for the portable .srt snapshot.
+
 APP_DIR = Path(__file__).resolve().parent
 CHECKPOINT_DIR = APP_DIR / "checkpoints"
 HISTORY_DIR = CHECKPOINT_DIR / "history"
@@ -197,58 +202,166 @@ def _safe_name(name: str) -> str:
     return re.sub(r"[^\w\-.]", "_", name or "srt")
 
 
-def save_checkpoint(subs, source_name: str, tag: str = "auto") -> str:
-    """Persist the full state to latest.json and a timestamped history entry.
-
-    Returns the timestamp string. Called from the translate loop (crash-safe,
-    one write per completed batch) and after edits.
-    """
-    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
-    HISTORY_DIR.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    payload = {
-        "source": source_name,
-        "tag": tag,
-        "saved": ts,
-        "blocks": len(subs),
-        "subs": subs,
-    }
-    try:
-        LATEST_JSON.write_text(
-            json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-        safe = _safe_name(source_name)
-        (HISTORY_DIR / f"{ts}_{safe}.json").write_text(
-            json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-        (HISTORY_DIR / f"{ts}_{safe}.srt").write_text(
-            build_srt(subs), encoding="utf-8-sig")
-    except OSError:
-        # persistence must never break the run — swallow filesystem errors
-        pass
-    return ts
+def _checkpoint_payload(subs, source_name, tag, ts):
+    return {"source": source_name, "tag": tag, "saved": ts,
+            "blocks": len(subs), "subs": subs}
 
 
-def list_checkpoints() -> list[Path]:
-    """Newest-first list of saved JSON checkpoints."""
-    if not HISTORY_DIR.exists():
-        return []
-    return sorted(HISTORY_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime,
-                  reverse=True)
+class LocalStore:
+    """File-based checkpoint backend (ref = 'local:<path>')."""
 
-
-def load_checkpoint(path: Path) -> tuple[list[dict], str, str]:
-    data = json.loads(Path(path).read_text(encoding="utf-8"))
-    return data["subs"], data.get("source", ""), data.get("saved", "")
-
-
-def prune_checkpoints(keep: int = 50) -> None:
-    """Drop the oldest history entries beyond `keep` to avoid unbounded growth."""
-    cps = list_checkpoints()
-    for p in cps[keep:]:
+    def save_checkpoint(self, subs, source_name, tag="auto"):
+        CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+        HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        payload = _checkpoint_payload(subs, source_name, tag, ts)
         try:
-            p.unlink()
-            p.with_suffix(".srt").unlink()
+            LATEST_JSON.write_text(
+                json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            safe = _safe_name(source_name)
+            (HISTORY_DIR / f"{ts}_{safe}.json").write_text(
+                json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            (HISTORY_DIR / f"{ts}_{safe}.srt").write_text(
+                build_srt(subs), encoding="utf-8-sig")
         except OSError:
             pass
+        return ts
+
+    def list_checkpoints(self):
+        if not HISTORY_DIR.exists():
+            return []
+        out = []
+        for p in sorted(HISTORY_DIR.glob("*.json"),
+                        key=lambda x: x.stat().st_mtime, reverse=True):
+            m = re.match(r"(\d{8}_\d{6})_(.*)\.json$", p.name)
+            if not m:
+                continue
+            out.append(Checkpoint(ref=f"local:{p}", source=m.group(2),
+                                  saved=m.group(1), blocks=0,
+                                  label=f"{m.group(1)} · {m.group(2)}"))
+        return out
+
+    def load_checkpoint(self, ref):
+        path = Path(str(ref).removeprefix("local:"))
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data["subs"], data.get("source", ""), data.get("saved", "")
+
+    def latest_meta(self):
+        if not LATEST_JSON.exists():
+            return None
+        try:
+            return json.loads(LATEST_JSON.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+
+    def load_latest(self):
+        meta = self.latest_meta()
+        if not meta:
+            return None
+        return meta["subs"], meta.get("source", ""), meta.get("saved", "")
+
+    def prune(self, keep=50):
+        cps = self.list_checkpoints()
+        for c in cps[keep:]:
+            try:
+                Path(str(c.ref).removeprefix("local:")).unlink()
+            except OSError:
+                pass
+
+
+class Store:
+    """Unified checkpoint facade: local always, Drive when configured."""
+
+    def __init__(self, local: LocalStore, drive: DriveStore | None):
+        self.local = local
+        self.drive = drive
+
+    def save_checkpoint(self, subs, source_name, tag="auto"):
+        ts = self.local.save_checkpoint(subs, source_name, tag)
+        if self.drive:
+            try:
+                self.drive.save_checkpoint(subs, source_name, tag)
+            except Exception:
+                pass
+        return ts
+
+    def list_checkpoints(self):
+        if self.drive:
+            try:
+                cps = self.drive.list_checkpoints()
+                if cps:
+                    return cps
+            except Exception:
+                pass
+        return self.local.list_checkpoints()
+
+    def load_checkpoint(self, ref):
+        if self.drive and str(ref).startswith("drive:"):
+            try:
+                return self.drive.load_checkpoint(ref)
+            except Exception:
+                pass
+        return self.local.load_checkpoint(ref)
+
+    def latest_meta(self):
+        if self.drive:
+            try:
+                meta = self.drive.latest_meta()
+                if meta:
+                    return meta
+            except Exception:
+                pass
+        return self.local.latest_meta()
+
+    def load_latest(self):
+        if self.drive:
+            try:
+                latest = self.drive.load_latest()
+                if latest:
+                    return latest
+            except Exception:
+                pass
+        return self.local.load_latest()
+
+    def prune(self, keep=50):
+        self.local.prune(keep)
+        if self.drive:
+            try:
+                self.drive.prune(keep)
+            except Exception:
+                pass
+
+
+def _read_drive_token():
+    """Return the personal Drive token from Streamlit secrets, if present.
+
+    `st.secrets.drive_token` may be a dict, a JSON string, or (for local dev) a
+    path to a token file. Returns None when unavailable -> local-only mode.
+    """
+    raw = None
+    try:
+        raw = st.secrets.get("drive_token")
+    except Exception:
+        raw = None
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        stripped = raw.strip()
+        if stripped.startswith("{"):
+            try:
+                return json.loads(stripped)
+            except json.JSONDecodeError:
+                return None
+        p = Path(stripped)
+        if p.exists():
+            try:
+                return json.loads(p.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                return None
+    return None
+
+
+store = Store(LocalStore(), get_drive_store(_read_drive_token()))
 
 
 # ---------------------------------------------------------------- key pool
@@ -398,17 +511,12 @@ if uploader:
 if not st.session_state.subs:
     # Fresh session: offer recovery from the last checkpoint before asking for
     # an upload. This is how lost work is recovered after a session drop.
-    cps = list_checkpoints()
+    cps = store.list_checkpoints()
     if cps:
-        latest_meta = None
-        if LATEST_JSON.exists():
-            try:
-                latest_meta = json.loads(LATEST_JSON.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                latest_meta = None
-        src = latest_meta.get("source") if latest_meta else ""
-        saved = latest_meta.get("saved") if latest_meta else ""
-        blocks = latest_meta.get("blocks") if latest_meta else ""
+        meta = store.latest_meta()
+        src = meta.get("source") if meta else ""
+        saved = meta.get("saved") if meta else ""
+        blocks = meta.get("blocks") if meta else ""
         st.warning(
             f"Found saved work: **{src}** ({blocks} blocks, saved {saved}). "
             "Recover it below instead of starting over."
@@ -417,11 +525,15 @@ if not st.session_state.subs:
         with c_rec:
             if st.button("♻️ Recover last session", type="primary"):
                 try:
-                    subs, src_name, saved_at = load_checkpoint(LATEST_JSON)
-                    st.session_state.subs = subs
-                    st.session_state.loaded_file = f"recovered:{src_name}:{saved_at}"
-                    st.rerun()
-                except (OSError, json.JSONDecodeError, KeyError) as e:
+                    latest = store.load_latest()
+                    if latest:
+                        subs, src_name, saved_at = latest
+                        st.session_state.subs = subs
+                        st.session_state.loaded_file = f"recovered:{src_name}:{saved_at}"
+                        st.rerun()
+                    else:
+                        st.error("No recoverable checkpoint found.")
+                except Exception as e:
                     st.error(f"Recovery failed: {e}")
         with c_up:
             st.caption("or upload a new .srt below.")
@@ -449,22 +561,18 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Run history")
-    cps = list_checkpoints()
+    cps = store.list_checkpoints()
     if cps:
         st.caption(f"{len(cps)} saved checkpoint(s)")
-        for p in cps[:8]:
-            try:
-                meta = json.loads(p.read_text(encoding="utf-8"))
-                label = f"{meta.get('saved', '')} · {meta.get('source', '')} · {meta.get('blocks', '')} blk"
-            except (OSError, json.JSONDecodeError):
-                label = p.name
-            if st.button(label, key=f"restore_{p.stem}"):
+        for cp in cps[:8]:
+            key = f"restore_{cp.ref.replace(':', '_').replace('.', '_').replace('-', '_')}"
+            if st.button(cp.label, key=key):
                 try:
-                    rsubs, rsrc, rsaved = load_checkpoint(p)
+                    rsubs, rsrc, rsaved = store.load_checkpoint(cp.ref)
                     st.session_state.subs = rsubs
                     st.session_state.loaded_file = f"recovered:{rsrc}:{rsaved}"
                     st.rerun()
-                except (OSError, json.JSONDecodeError, KeyError) as e:
+                except Exception as e:
                     st.error(f"Restore failed: {e}")
     else:
         st.caption("No checkpoints yet — run a translation and they'll appear here.")
@@ -522,7 +630,7 @@ if st.button("🚀 Translate", type="primary", width="stretch"):
             # persist every 12 applied blocks so a crash mid-run loses at most
             # a handful of blocks, not the whole run
             if checkpoint_meta["count"] % 12 == 0:
-                save_checkpoint(subs, source_name, tag="progress")
+                store.save_checkpoint(subs, source_name, tag="progress")
 
         def progress_cb(resolved, total, tag):
             progress_bar.progress(resolved / max(1, total))
@@ -541,8 +649,8 @@ if st.button("🚀 Translate", type="primary", width="stretch"):
         for idx, t in result.items():
             subs[idx]["arabic"] = t
 
-        save_checkpoint(subs, source_name, tag="complete")
-        prune_checkpoints()
+        store.save_checkpoint(subs, source_name, tag="complete")
+        store.prune()
 
         still = [i for i in pending if not subs[i]["arabic"].strip()]
         elapsed = time.time() - t0
@@ -598,8 +706,8 @@ for i, row in edited.iterrows():
     subs[i]["english_lines"] = str(row["English"]).split("\n")
 _fp_after = [s["arabic"] for s in subs]
 if _fp_after != _fp_before:
-    save_checkpoint(subs, st.session_state.loaded_file or "edited.srt",
-                    tag="edit")
+    store.save_checkpoint(subs, st.session_state.loaded_file or "edited.srt",
+                          tag="edit")
 
 # ---------------------------------------------------------------- download
 
