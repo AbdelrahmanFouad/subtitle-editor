@@ -1,3 +1,5 @@
 google-genai
 chardet
 google-api-core
+streamlit
+pandas
